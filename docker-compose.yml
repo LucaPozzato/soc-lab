@@ -1,0 +1,69 @@
+services:
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - bootstrap.memory_lock=true
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.0
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - xpack.security.enabled=false
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  suricata:
+    image: jasonish/suricata:latest
+    container_name: suricata
+    entrypoint: ["/suricata-start.sh"]
+    volumes:
+      - ./scripts/suricata-start.sh:/suricata-start.sh:ro
+      - ./config/suricata/suricata.yaml:/etc/suricata/suricata.yaml
+      - ./config/suricata/threshold.config:/etc/suricata/threshold.config
+      - ./logs/suricata:/var/log/suricata
+      - ./pcap:/pcap:ro
+      - ./rules:/etc/suricata/rules/custom
+      - suricata_rules:/var/lib/suricata/rules
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.13.0
+    container_name: filebeat
+    user: root
+    volumes:
+      - ./config/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ./logs/suricata:/var/log/suricata:ro
+      - filebeat_data:/usr/share/filebeat/data
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    command: filebeat -e --strict.perms=false
+
+volumes:
+  es_data:
+  filebeat_data:
+  suricata_rules:

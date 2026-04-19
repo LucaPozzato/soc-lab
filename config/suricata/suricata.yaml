@@ -1,0 +1,100 @@
+%YAML 1.1
+---
+vars:
+  address-groups:
+    HOME_NET: "[10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,127.0.0.0/24,169.254.0.0/16,fc00::/7,::1/128]"
+    EXTERNAL_NET: "!$HOME_NET"
+    # Server groups — broad defaults work for any environment
+    HTTP_SERVERS: "$HOME_NET"
+    SMTP_SERVERS: "$HOME_NET"
+    SQL_SERVERS: "$HOME_NET"
+    DNS_SERVERS: "$HOME_NET"
+    TELNET_SERVERS: "$HOME_NET"
+    DC_SERVERS: "$HOME_NET"
+    AIM_SERVERS: "$EXTERNAL_NET"
+    # ICS/SCADA (unused in most envs but required by ET rules)
+    DNP3_SERVER: "$HOME_NET"
+    DNP3_CLIENT: "$HOME_NET"
+    MODBUS_CLIENT: "$HOME_NET"
+    MODBUS_SERVER: "$HOME_NET"
+    ENIP_CLIENT: "$HOME_NET"
+    ENIP_SERVER: "$HOME_NET"
+  port-groups:
+    # Common ports — any not listed here still get inspected by proto detection
+    HTTP_PORTS: "[80,8080,8000,8008,8888]"
+    SHELLCODE_PORTS: "!80"
+    ORACLE_PORTS: 1521
+    SSH_PORTS: 22
+    DNP3_PORTS: 20000
+    MODBUS_PORTS: 502
+    FILE_DATA_PORTS: "[$HTTP_PORTS,110,143]"
+    FTP_PORTS: 21
+    VXLAN_PORTS: 4789
+    TEREDO_PORTS: 3544
+
+default-log-dir: /var/log/suricata/
+
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      append: yes
+      types:
+        - alert
+        - flow
+        - dns
+        - http:
+            extended: yes
+        - tls:
+            extended: yes
+        - smtp
+        - ssh
+        - ftp
+        - smb
+        - rdp
+        - krb5
+        - dcerpc
+        - nfs
+        - ike
+        - tftp
+        - http2
+        - quic
+        - anomaly
+        - sip
+        - snmp
+        - mqtt
+        - rfb
+        - ldap
+        - doh2
+        - pop3
+
+stream:
+  checksum-validation: no
+
+pcap-file:
+  checksum-checks: no
+
+detection:
+  profile: medium
+  custom-values:
+    toclient-groups: 3
+    toserver-groups: 25
+
+default-rule-path: /var/lib/suricata/rules
+
+rule-files:
+  - "*.rules"
+  - /etc/suricata/rules/custom/*.rules
+
+threshold-file: /etc/suricata/threshold.config
+
+logging:
+  default-log-level: notice
+  outputs:
+    - console:
+        enabled: yes
+    - file:
+        enabled: yes
+        level: info
+        filename: /var/log/suricata/suricata.log
