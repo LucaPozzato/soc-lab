@@ -10,6 +10,7 @@ Personal security lab for testing Suricata IDS detection and whitelist rules via
 | kibana | elastic/kibana:8.13.0 | Dashboards — http://localhost:5601 |
 | suricata | jasonish/suricata:latest | IDS — writes eve.json |
 | filebeat | elastic/filebeat:8.13.0 | Ships suricata logs to ES |
+| elastalert2 | jertel/elastalert2:latest | Alerting — converts Sigma rules, fires on ES matches |
 
 ## Quick Start
 
@@ -26,23 +27,28 @@ config/
   suricata/suricata.yaml      Suricata config
   suricata/threshold.config   Alert suppression (checksum noise SIDs)
   filebeat/filebeat.yml       Log shipping config
+  elastalert2/
+    elastalert2.yml           ElastAlert2 config (run interval, buffer window)
+    rules/                    Hand-written ElastAlert2 rules (deployed directly)
 scripts/
   suricata-start.sh           Container entrypoint: downloads rules on first run
+  elastalert-start.sh         Container entrypoint: converts Sigma rules, starts ElastAlert2
 logs/
   suricata/                   eve.json and suricata.log written here
 pcap/                         Drop .pcap files here for replay
-pcap/live/                    Live capture PCAPs (managed by live-capture.sh)
-rules/                        Custom .rules files (auto-loaded by Suricata)
+rules/
+  suricata/                   Custom Suricata .rules files (auto-loaded by Suricata)
+  sigma/                      Sigma rule files (auto-converted to ElastAlert2 on startup)
 ```
 
 ## Scripts
 
 | Script | What it does |
 |---|---|
-| `docker.sh start` | Start stack, wait for healthy, create ES data view |
+| `docker.sh start` | Start stack, wait for healthy, create ES data views |
 | `docker.sh stop` | Stop containers, keep volumes (ES data + rules) |
 | `docker.sh reset` | Stop containers and wipe all volumes |
-| `check-health.sh` | Container status, ES cluster health, recent log samples |
+| `check-health.sh` | Container status, ES cluster health, recent log samples, ElastAlert2 alert count |
 | `replay-pcap.sh` | Replay a .pcap through Suricata |
 | `live-capture.sh` | Continuous tcpdump capture with auto-replay |
 | `reload-rules.sh` | Pull latest ET community rules, reload without restart |
@@ -55,7 +61,27 @@ cp /path/to/capture.pcap ./pcap/
 ./replay-pcap.sh pcap/capture.pcap
 ```
 
-Each replay wipes the previous ES data and eve.json for a clean slate. Events appear in Kibana under `suricata-*`.
+Each replay wipes previous Suricata events and all ElastAlert2 state (alerts, status, silence), then restarts ElastAlert2 so it rescans from scratch. Suricata events appear in Kibana under `suricata-*`; ElastAlert2 alerts under `elastalert2_alerts`. Both are combined in the `soc-alerts` unified alias (Kibana data view "Alerts"), which shows Suricata IDS alerts and ElastAlert2/Sigma fired alerts together in one place.
+
+The optional `-now` flag shifts all event timestamps to the current time while preserving relative timing:
+
+```bash
+./replay-pcap.sh pcap/capture.pcap -now
+```
+
+Without `-now`, original PCAP timestamps are preserved and Kibana shows events at their original capture time.
+
+## ElastAlert2 and Sigma Rules
+
+ElastAlert2 queries Elasticsearch on a 5-second cycle and fires alerts when rule conditions match.
+
+**Two ways to write rules:**
+
+1. **Sigma rules** — place `.yml` files in `./rules/sigma/`. On each container start, `elastalert-start.sh` converts them to ElastAlert2 format via `sigma convert`. Good for portable, shareable detection logic.
+
+2. **Native ElastAlert2 rules** — place `.yaml` files in `./config/elastalert2/rules/`. These are deployed directly without conversion. Good for rules that need ElastAlert2-specific features.
+
+Alerts are stored in the `elastalert2_alerts` index in Elasticsearch. The `@timestamp` field is patched to reflect the original event time (not the time ElastAlert2 ran), so Kibana shows alerts on the correct timeline.
 
 ## Live Capture
 
@@ -139,7 +165,7 @@ smbclient //127.0.1.1/share -U user --interface 127.0.0.1
 ### Checking alert count after a replay
 
 ```bash
-# Total alerts
+# Total Suricata alerts
 curl -s "http://localhost:9200/suricata-*/_count?q=event_type:alert"
 
 # Alerts by signature
@@ -147,16 +173,28 @@ curl -s "http://localhost:9200/suricata-*/_search?pretty" \
   -H 'Content-Type: application/json' \
   -d '{"size":0,"query":{"term":{"event_type":"alert"}},"aggs":{"by_sig":{"terms":{"field":"alert.signature.keyword","size":20}}}}'
 
+# ElastAlert2 fired alerts
+curl -s "http://localhost:9200/elastalert2_alerts/_count"
+
+# All alerts unified (Suricata IDS + ElastAlert2/Sigma)
+curl -s "http://localhost:9200/soc-alerts/_count"
+
 # Quick count from eve.json directly
 docker exec suricata grep -c '"event_type":"alert"' /var/log/suricata/eve.json
 ```
 
 ## Custom Rules
 
-Add `.rules` files to `./rules/` — loaded automatically by Suricata. To reload without restarting:
+**Suricata rules:** Add `.rules` files to `./rules/suricata/` — loaded automatically by Suricata. To reload without restarting:
 
 ```bash
 ./reload-rules.sh
+```
+
+**Sigma rules:** Add `.yml` files to `./rules/sigma/` — converted to ElastAlert2 format on every container start. Restart the `elastalert2` container after adding new rules:
+
+```bash
+docker restart elastalert2
 ```
 
 Suricata rule syntax reference: https://docs.suricata.io/en/latest/rules/index.html
@@ -173,3 +211,4 @@ Suricata rule syntax reference: https://docs.suricata.io/en/latest/rules/index.h
 - **ES yellow status**: Normal on a single-node cluster — replicas are unassigned.
 - **Live capture delay**: Traffic appears in Kibana after the current rotation completes, not in real time.
 - **First-run rule download**: Requires internet access, takes ~1-2 minutes.
+- **ElastAlert2 timestamp race**: `@timestamp` on alerts is patched to event time by a background loop every 2 seconds. Alerts will briefly show processing time in Kibana immediately after firing (window is ~2 seconds).

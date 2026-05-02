@@ -1,15 +1,29 @@
 #!/bin/bash
 set -e
 
-if [ -z "$1" ]; then
-  echo "Usage: ./replay-pcap.sh pcap/<filename.pcap>"
+# Parse args — accept pcap path and optional -now flag in any order
+NOW_MODE=false
+PCAP_FILE=""
+for arg in "$@"; do
+  case "$arg" in
+    -now) NOW_MODE=true ;;
+    *)    PCAP_FILE="$arg" ;;
+  esac
+done
+
+if [ -z "$PCAP_FILE" ]; then
+  echo "Usage: ./replay-pcap.sh <pcap-file> [-now]"
+  echo ""
+  echo "  -now   Shift all event timestamps to now (optional)."
+  echo "         Without -now, original packet timestamps are preserved and"
+  echo "         alert timestamps are automatically corrected to match."
+  echo ""
   echo "Files available:"
   ls ./pcap/*.pcap 2>/dev/null || echo "  (none found)"
   exit 1
 fi
 
-PCAP_FILE="$1"
-PCAP_NAME=$(basename "$1")
+PCAP_NAME=$(basename "$PCAP_FILE")
 
 if [ ! -f "$PCAP_FILE" ]; then
   echo "ERROR: $PCAP_FILE not found"
@@ -18,12 +32,22 @@ fi
 
 echo "======================================"
 echo " Replaying: $PCAP_NAME"
+[ "$NOW_MODE" = "true" ] && echo " Timestamps: shifted to now"
 echo "======================================"
 
-echo "[*] Clearing previous logs and index..."
+echo "[*] Clearing previous logs and indices..."
 curl -s "http://localhost:9200/_cat/indices/suricata-*?h=index" | \
   xargs -I{} curl -s -X DELETE "http://localhost:9200/{}" >/dev/null
-docker stop filebeat >/dev/null
+# Delete documents but keep indices — dropping them causes ElastAlert2 to
+# error on missing mappings. Silence must also be cleared so the rule can
+# re-fire after a replay. ElastAlert2 is restarted so its in-memory scan
+# window resets; clearing the status index alone doesn't work while it runs.
+DQ='{"query":{"match_all":{}}}'
+for idx in elastalert2_alerts elastalert2_alerts_status elastalert2_alerts_silence; do
+  curl -s -X POST "http://localhost:9200/${idx}/_delete_by_query" \
+      -H 'Content-Type: application/json' -d "$DQ" >/dev/null 2>&1 || true
+done
+docker stop filebeat elastalert2 >/dev/null
 docker exec suricata sh -c 'rm -f /var/log/suricata/eve.json /var/log/suricata/suricata.log'
 
 echo "[*] Sending pcap to Suricata..."
@@ -33,11 +57,79 @@ docker exec suricata suricata \
   --pidfile /var/run/suricata-replay.pid \
   -l /var/log/suricata \
   -k none
-echo "[+] Suricata done. Starting filebeat to ship events..."
-docker start filebeat >/dev/null
+
+if [ "$NOW_MODE" = "true" ]; then
+  echo "[*] Shifting timestamps to now..."
+  python3 - <<'EOF'
+import json
+from datetime import datetime, timezone, timedelta
+
+eve = "logs/suricata/eve.json"
+TS_FMT = "%Y-%m-%dT%H:%M:%S.%f+0000"
+
+events = []
+with open(eve) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                events.append(line)
+
+# Find the earliest timestamp so we can anchor the whole trace to now
+# while preserving relative timing between events.
+earliest = None
+for e in events:
+    if not isinstance(e, dict):
+        continue
+    raw = e.get("timestamp", "")
+    try:
+        ts = datetime.fromisoformat(raw.replace("+0000", "+00:00"))
+        if earliest is None or ts < earliest:
+            earliest = ts
+    except Exception:
+        pass
+
+if earliest is None:
+    print("  No timestamps found — nothing to shift.")
+else:
+    now = datetime.now(timezone.utc)
+    offset = now - earliest
+    count = 0
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        raw = e.get("timestamp", "")
+        try:
+            ts = datetime.fromisoformat(raw.replace("+0000", "+00:00"))
+            e["timestamp"] = (ts + offset).strftime(TS_FMT)
+            count += 1
+        except Exception:
+            pass
+    print(f"  Shifted {count} events by {int(offset.total_seconds())}s")
+
+with open(eve, "w") as f:
+    for e in events:
+        f.write((json.dumps(e) if isinstance(e, dict) else e) + "\n")
+EOF
+fi
+
+echo "[+] Suricata done. Starting filebeat and elastalert2..."
+
+# Ensure template + alias survive volume wipes and are in place before Filebeat
+# creates the new suricata-* index (template applies at index-creation time).
+curl -s -X PUT "http://localhost:9200/_index_template/suricata-soc-alerts" \
+  -H 'Content-Type: application/json' \
+  -d '{"index_patterns":["suricata-*"],"template":{"aliases":{"soc-alerts":{"filter":{"term":{"event_type":"alert"}}}}}}' \
+  >/dev/null 2>&1
+
+docker start filebeat elastalert2 >/dev/null
 
 echo ""
 echo "======================================"
-echo " Replay complete. Logs shipping to Elasticsearch via Filebeat."
+echo " Replay complete."
+echo " Events shipping to Elasticsearch via Filebeat."
+echo " ElastAlert2 will fire within ~30s."
 echo " Open Kibana at http://localhost:5601"
 echo "======================================"

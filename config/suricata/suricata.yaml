@@ -85,7 +85,7 @@ default-rule-path: /var/lib/suricata/rules
 
 rule-files:
   - "*.rules"
-  - /etc/suricata/rules/custom/*.rules
+  - "/etc/suricata/rules/custom/*.rules"
 
 threshold-file: /etc/suricata/threshold.config
 

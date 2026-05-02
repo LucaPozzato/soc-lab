@@ -29,8 +29,8 @@ ok "Docker is running"
 echo ""
 echo -e "${BOLD}[2/4] Creating directories${NC}"
 
-mkdir -p logs/suricata pcap rules
-ok "logs/suricata, pcap, rules — ready"
+mkdir -p logs/suricata pcap rules/suricata rules/sigma
+ok "logs/suricata, pcap, rules/suricata, rules/sigma — ready"
 
 # ── Start stack ────────────────────────────────────────────────
 echo ""
@@ -67,19 +67,52 @@ for i in $(seq 1 60); do
     [ $i -eq 60 ] && { echo ""; warn "Rules still downloading — check: docker logs suricata"; }
 done
 
-# Kibana data view
-echo -n "    Kibana data view"
+# ES index template + soc-alerts alias (idempotent — safe to re-run)
+echo -n "    ES index template"
+curl -s -X PUT "http://localhost:9200/_index_template/suricata-soc-alerts" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "index_patterns": ["suricata-*"],
+    "template": {
+      "aliases": {
+        "soc-alerts": {
+          "filter": {"term": {"event_type": "alert"}}
+        }
+      }
+    }
+  }' >/dev/null 2>&1
+# Apply alias to any suricata-* indices that already exist
+curl -s -X POST "http://localhost:9200/_aliases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "actions": [
+      {"add": {"index": "suricata-*", "alias": "soc-alerts",
+               "filter": {"term": {"event_type": "alert"}},
+               "ignore_unavailable": true}},
+      {"add": {"index": "elastalert2_alerts", "alias": "soc-alerts",
+               "ignore_unavailable": true}}
+    ]
+  }' >/dev/null 2>&1
+echo -e " ${GREEN}ready${NC}"
+
+# Kibana data views
+echo -n "    Kibana data views"
 for i in $(seq 1 24); do
     if curl -s http://localhost:5601/api/status 2>/dev/null | grep -q '"level":"available"'; then
-        HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://localhost:5601/api/data_views/data_view" \
-          -H 'kbn-xsrf: true' -H 'Content-Type: application/json' \
-          -d '{"data_view":{"title":"suricata-*","timeFieldName":"@timestamp","name":"Suricata"}}')
-        [ "$HTTP" = "200" ] && echo -e " ${GREEN}created${NC}" || echo -e " ${GREEN}already exists${NC}"
+        for dv in \
+          '{"title":"suricata-*","timeFieldName":"@timestamp","name":"Suricata"}' \
+          '{"title":"elastalert2_alerts","timeFieldName":"@timestamp","name":"ElastAlert2 Alerts"}' \
+          '{"title":"soc-alerts","timeFieldName":"@timestamp","name":"Alerts"}'; do
+            curl -s -o /dev/null -X POST "http://localhost:5601/api/data_views/data_view" \
+              -H 'kbn-xsrf: true' -H 'Content-Type: application/json' \
+              -d "{\"data_view\":$dv}"
+        done
+        echo -e " ${GREEN}ready${NC}"
         break
     fi
     echo -n "."
     sleep 5
-    [ $i -eq 24 ] && { echo ""; warn "Kibana not ready — data view not created"; }
+    [ $i -eq 24 ] && { echo ""; warn "Kibana not ready — data views not created"; }
 done
 
 # Filebeat

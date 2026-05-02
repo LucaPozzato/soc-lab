@@ -10,6 +10,7 @@ filebeat.inputs:
       source_type: suricata
     fields_under_root: true
     tags: ["suricata"]
+    scan_frequency: 1s
 
 processors:
   - timestamp:

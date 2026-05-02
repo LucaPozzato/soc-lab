@@ -15,8 +15,8 @@ docker exec suricata rm -f \
   /var/lib/suricata/rules/dnp3-events.rules \
   /var/lib/suricata/rules/modbus-events.rules
 
-echo "[*] Custom rules in ./rules/:"
-ls ./rules/*.rules 2>/dev/null && echo "" || echo "  (none found — add .rules files to ./rules/)"
+echo "[*] Custom rules in ./rules/suricata/:"
+ls ./rules/suricata/*.rules 2>/dev/null && echo "" || echo "  (none found — add .rules files to ./rules/suricata/)"
 
 echo "[+] Rules updated. Next replay will use the latest ruleset."
 echo "======================================"

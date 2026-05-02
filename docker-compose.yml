@@ -44,7 +44,7 @@ services:
       - ./config/suricata/threshold.config:/etc/suricata/threshold.config
       - ./logs/suricata:/var/log/suricata
       - ./pcap:/pcap:ro
-      - ./rules:/etc/suricata/rules/custom
+      - ./rules/suricata:/etc/suricata/rules/custom
       - suricata_rules:/var/lib/suricata/rules
     depends_on:
       elasticsearch:
@@ -62,6 +62,20 @@ services:
       elasticsearch:
         condition: service_healthy
     command: filebeat -e --strict.perms=false
+
+  elastalert2:
+    image: jertel/elastalert2:latest
+    container_name: elastalert2
+    user: root
+    volumes:
+      - ./scripts/elastalert-start.sh:/elastalert-start.sh:ro
+      - ./config/elastalert2/elastalert2.yml:/opt/elastalert2/config.yaml:ro
+      - ./config/elastalert2/rules:/opt/elastalert2/rules-static:ro
+      - ./rules/sigma:/opt/sigma/rules:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/elastalert-start.sh"]
 
 volumes:
   es_data:

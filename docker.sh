@@ -36,8 +36,8 @@ cmd_start() {
 
     echo ""
     echo -e "${BOLD}[2/4] Creating directories${NC}"
-    mkdir -p logs/suricata pcap rules
-    ok "logs/suricata, pcap, rules — ready"
+    mkdir -p logs/suricata pcap rules/suricata rules/sigma
+    ok "logs/suricata, pcap, rules/suricata, rules/sigma — ready"
 
     echo ""
     echo -e "${BOLD}[3/4] Starting containers${NC}"
@@ -76,6 +76,12 @@ cmd_start() {
         echo -n "."; sleep 5
         [ $i -eq 24 ] && { echo ""; warn "Kibana not ready — data view not created"; }
     done
+
+    echo -n "    Alerts data view"
+    HTTP2=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://localhost:5601/api/data_views/data_view" \
+      -H 'kbn-xsrf: true' -H 'Content-Type: application/json' \
+      -d '{"data_view":{"title":"elastalert2_alerts*","timeFieldName":"@timestamp","name":"ElastAlert2 Alerts"}}')
+    [ "$HTTP2" = "200" ] && echo -e " ${GREEN}created${NC}" || echo -e " ${GREEN}already exists${NC}"
 
     echo -n "    Filebeat        "
     if docker logs filebeat 2>&1 | grep -q "Connection to backoff.*established"; then

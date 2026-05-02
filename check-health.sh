@@ -26,6 +26,14 @@ echo "[*] Suricata eve.json (last 3 events):"
 tail -3 ./logs/suricata/eve.json 2>/dev/null || echo "  No events yet"
 
 echo ""
+echo "[*] ElastAlert2 alerts in ES:"
+curl -s "http://localhost:9200/elastalert2_alerts/_count" 2>/dev/null | grep -o '"count":[0-9]*' || echo "  No alerts index yet"
+
+echo ""
+echo "[*] ElastAlert2 logs (last 5 lines):"
+docker logs elastalert2 2>&1 | tail -5
+
+echo ""
 echo "======================================"
 echo " Kibana: http://localhost:5601"
 echo " Elasticsearch: http://localhost:9200"
