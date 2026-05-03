@@ -36,8 +36,8 @@ cmd_start() {
 
     echo ""
     echo -e "${BOLD}[2/4] Creating directories${NC}"
-    mkdir -p logs/suricata pcap rules/suricata rules/sigma
-    ok "logs/suricata, pcap, rules/suricata, rules/sigma — ready"
+    mkdir -p docker-logs/suricata logs pcap rules/suricata rules/sigma
+    ok "docker-logs/suricata, logs, pcap, rules/suricata, rules/sigma — ready"
 
     echo ""
     echo -e "${BOLD}[3/4] Starting containers${NC}"
@@ -55,6 +55,16 @@ cmd_start() {
         [ $i -eq 40 ] && { echo ""; die "Elasticsearch did not become healthy in time."; }
     done
 
+    echo -n "    Ingest pipelines"
+    pipe_count=0
+    for pf in pipelines/known/*.json pipelines/generated/*.json; do
+        [ -f "$pf" ] || continue
+        name=$(basename "$pf" .json)
+        curl -s -o /dev/null -X PUT "http://localhost:9200/_ingest/pipeline/$name" \
+            -H 'Content-Type: application/json' --data-binary @"$pf" && pipe_count=$((pipe_count + 1))
+    done
+    echo -e " ${GREEN}${pipe_count} loaded${NC}"
+
     echo -n "    Suricata rules "
     for i in $(seq 1 60); do
         if docker logs suricata 2>&1 | grep -q "waiting for pcap"; then
@@ -65,23 +75,34 @@ cmd_start() {
         [ $i -eq 60 ] && { echo ""; warn "Rules still downloading — check: docker logs suricata"; }
     done
 
-    echo -n "    Kibana data view"
+    # ES index template (auto-applies soc-alerts alias to new suricata-* indices)
+    curl -s -X PUT "http://localhost:9200/_index_template/suricata-soc-alerts" \
+      -H 'Content-Type: application/json' \
+      -d '{"index_patterns":["suricata-*"],"template":{"aliases":{"soc-alerts":{"filter":{"term":{"event_type":"alert"}}}}}}' \
+      >/dev/null 2>&1
+    curl -s -X POST "http://localhost:9200/_aliases" \
+      -H 'Content-Type: application/json' \
+      -d '{"actions":[
+        {"add":{"index":"suricata-*","alias":"soc-alerts","filter":{"term":{"event_type":"alert"}},"ignore_unavailable":true}},
+        {"add":{"index":"elastalert2_alerts","alias":"soc-alerts","ignore_unavailable":true}}
+      ]}' >/dev/null 2>&1
+
+    echo -n "    Kibana data views"
     for i in $(seq 1 24); do
         if curl -s http://localhost:5601/api/status 2>/dev/null | grep -q '"level":"available"'; then
-            HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://localhost:5601/api/data_views/data_view" \
-              -H 'kbn-xsrf: true' -H 'Content-Type: application/json' \
-              -d '{"data_view":{"title":"suricata-*","timeFieldName":"@timestamp","name":"Suricata"}}')
-            [ "$HTTP" = "200" ] && echo -e " ${GREEN}created${NC}" || echo -e " ${GREEN}already exists${NC}"; break
+            for dv in \
+              '{"title":"suricata-*","timeFieldName":"@timestamp","name":"Suricata"}' \
+              '{"title":"elastalert2_alerts","timeFieldName":"@timestamp","name":"ElastAlert2 Alerts"}' \
+              '{"title":"soc-alerts","timeFieldName":"@timestamp","name":"Alerts"}'; do
+                curl -s -o /dev/null -X POST "http://localhost:5601/api/data_views/data_view" \
+                  -H 'kbn-xsrf: true' -H 'Content-Type: application/json' \
+                  -d "{\"data_view\":$dv}"
+            done
+            echo -e " ${GREEN}created${NC}"; break
         fi
         echo -n "."; sleep 5
-        [ $i -eq 24 ] && { echo ""; warn "Kibana not ready — data view not created"; }
+        [ $i -eq 24 ] && { echo ""; warn "Kibana not ready — data views not created"; }
     done
-
-    echo -n "    Alerts data view"
-    HTTP2=$(curl -s -o /dev/null -w "%{http_code}" -X POST "http://localhost:5601/api/data_views/data_view" \
-      -H 'kbn-xsrf: true' -H 'Content-Type: application/json' \
-      -d '{"data_view":{"title":"elastalert2_alerts*","timeFieldName":"@timestamp","name":"ElastAlert2 Alerts"}}')
-    [ "$HTTP2" = "200" ] && echo -e " ${GREEN}created${NC}" || echo -e " ${GREEN}already exists${NC}"
 
     echo -n "    Filebeat        "
     if docker logs filebeat 2>&1 | grep -q "Connection to backoff.*established"; then
@@ -101,6 +122,8 @@ cmd_start() {
     echo -e "  Replay a PCAP:   ${BOLD}./replay-pcap.sh <file.pcap>${NC}"
     echo -e "  Health check:    ${BOLD}./check-health.sh${NC}"
     echo -e "  Update rules:    ${BOLD}./reload-rules.sh${NC}"
+    echo -e "  Stop:            ${BOLD}./docker.sh stop${NC}"
+    echo -e "  Stop + wipe:     ${BOLD}./docker.sh reset${NC}"
     echo ""
 }
 

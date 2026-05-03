@@ -1,28 +1,40 @@
 #!/bin/bash
 set -euo pipefail
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    echo "Usage: ./live-capture.sh [interface] [rotation_seconds]"
-    echo ""
-    echo "Arguments:"
-    echo "  interface          Network interface to capture on (default: en0)"
-    echo "  rotation_seconds   How often to rotate the PCAP file (default: 10)"
-    echo ""
-    echo "Examples:"
-    echo "  ./live-capture.sh                  # capture on en0, rotate every 10s"
-    echo "  ./live-capture.sh en0 30           # rotate every 30s"
-    echo "  ./live-capture.sh en1 120          # different interface, 2-minute rotations"
-    echo ""
-    echo "Notes:"
-    echo "  - Requires the stack to be running: ./start.sh"
-    echo "  - Captured PCAPs are saved to pcap/live/"
-    echo "  - Events appear in Kibana at http://localhost:5601 with a ~rotation_seconds delay"
-    echo "  - Ctrl+C stops capture; indexed events remain in Kibana"
-    exit 0
-fi
+INTERFACE="en0"
+ROTATION_SECS=10
+KEEP=false
+POSITIONAL=()
 
-INTERFACE="${1:-en0}"
-ROTATION_SECS="${2:-10}"
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      echo "Usage: ./live-capture.sh [interface] [rotation_seconds] [--keep]"
+      echo ""
+      echo "Arguments:"
+      echo "  interface          Network interface to capture on (default: en0)"
+      echo "  rotation_seconds   How often to rotate the PCAP file (default: 10)"
+      echo "  --keep             Preserve existing Suricata data in ES instead of wiping"
+      echo ""
+      echo "Examples:"
+      echo "  ./live-capture.sh                  # capture on en0, rotate every 10s"
+      echo "  ./live-capture.sh en0 30           # rotate every 30s"
+      echo "  ./live-capture.sh en1 120 --keep   # keep previous session data"
+      echo ""
+      echo "Notes:"
+      echo "  - Requires the stack to be running: ./docker.sh start"
+      echo "  - Captured PCAPs are saved to pcap/live/"
+      echo "  - Events appear in Kibana at http://localhost:5601 with a ~rotation_seconds delay"
+      echo "  - Ctrl+C stops capture; indexed events remain in Kibana"
+      exit 0
+      ;;
+    --keep) KEEP=true ;;
+    *)      POSITIONAL+=("$arg") ;;
+  esac
+done
+
+[ "${#POSITIONAL[@]}" -ge 1 ] && INTERFACE="${POSITIONAL[0]}"
+[ "${#POSITIONAL[@]}" -ge 2 ] && ROTATION_SECS="${POSITIONAL[1]}"
 PCAP_DIR="./pcap/live"
 REPLAYED="$PCAP_DIR/.replayed"
 
@@ -40,19 +52,23 @@ trap cleanup SIGINT SIGTERM
 
 # ---- prereqs ----
 command -v tcpdump >/dev/null 2>&1 || { echo "ERROR: tcpdump not found"; exit 1; }
-docker exec suricata true 2>/dev/null || { echo "ERROR: Suricata container not running — run ./start.sh first"; exit 1; }
-curl -s "http://localhost:9200/_cluster/health" >/dev/null 2>&1 || { echo "ERROR: Elasticsearch not reachable — run ./start.sh first"; exit 1; }
+docker exec suricata true 2>/dev/null || { echo "ERROR: Suricata container not running — run ./docker.sh start first"; exit 1; }
+curl -s "http://localhost:9200/_cluster/health" >/dev/null 2>&1 || { echo "ERROR: Elasticsearch not reachable — run ./docker.sh start first"; exit 1; }
 
 # ---- clean slate ----
-log "Clearing previous session..."
 mkdir -p "$PCAP_DIR"
 rm -f "$PCAP_DIR"/capture_*.pcap "$REPLAYED"
 
-curl -s "http://localhost:9200/_cat/indices/suricata-*?h=index" | \
-    xargs -I{} curl -s -X DELETE "http://localhost:9200/{}" >/dev/null
-
-docker stop filebeat >/dev/null 2>&1 || true
-docker exec suricata sh -c 'rm -f /var/log/suricata/eve.json /var/log/suricata/suricata.log' 2>/dev/null || true
+if [ "$KEEP" = "false" ]; then
+    log "Clearing previous session..."
+    curl -s "http://localhost:9200/_cat/indices/suricata-*?h=index" | \
+        xargs -I{} curl -s -X DELETE "http://localhost:9200/{}" >/dev/null
+    docker stop filebeat >/dev/null 2>&1 || true
+    docker exec suricata sh -c 'rm -f /var/log/suricata/eve.json /var/log/suricata/suricata.log' 2>/dev/null || true
+else
+    log "Keeping existing data (--keep)..."
+    docker stop filebeat >/dev/null 2>&1 || true
+fi
 docker start filebeat >/dev/null
 
 # ---- start tcpdump ----

@@ -23,7 +23,7 @@ docker logs filebeat 2>&1 | tail -10
 
 echo ""
 echo "[*] Suricata eve.json (last 3 events):"
-tail -3 ./logs/suricata/eve.json 2>/dev/null || echo "  No events yet"
+tail -3 ./docker-logs/suricata/eve.json 2>/dev/null || echo "  No events yet"
 
 echo ""
 echo "[*] ElastAlert2 alerts in ES:"

@@ -18,6 +18,8 @@ if not r.get('index') or r['index'] in ('*', ''):
     r['index'] = 'suricata-*'
 if 'alert' not in r:
     r['alert'] = ['debug']
+if 'query_key' not in r:
+    r['query_key'] = 'flow_id'
 with open(path, 'w') as fh:
     yaml.dump(r, fh, default_flow_style=False, allow_unicode=True)
 EOF

@@ -53,6 +53,7 @@ rules/
 | `live-capture.sh` | Continuous tcpdump capture with auto-replay |
 | `reload-rules.sh` | Pull latest ET community rules, reload without restart |
 | `clean.sh` | Wipe ES indices, eve.json, and suricata.log for a clean slate |
+| `upload-logs.sh` | Upload arbitrary logs, auto-pick/LLM-generate ingest pipeline |
 
 ## PCAP Replay
 
@@ -66,7 +67,8 @@ Each replay wipes previous Suricata events and all ElastAlert2 state (alerts, st
 The optional `-now` flag shifts all event timestamps to the current time while preserving relative timing:
 
 ```bash
-./replay-pcap.sh pcap/capture.pcap -now
+./replay-pcap.sh pcap/capture.pcap --now
+./replay-pcap.sh pcap/capture.pcap --keep
 ```
 
 Without `-now`, original PCAP timestamps are preserved and Kibana shows events at their original capture time.
@@ -198,6 +200,41 @@ docker restart elastalert2
 ```
 
 Suricata rule syntax reference: https://docs.suricata.io/en/latest/rules/index.html
+
+## Upload Arbitrary Logs
+
+Use this when ingesting non-Suricata logs into Elasticsearch:
+
+```bash
+./upload-logs.sh logs/test/syslog.log
+./upload-logs.sh logs/test/cisco-asa.log --type cisco
+./upload-logs.sh logs/test/apache-access.log --type apache-access --now
+./upload-logs.sh --batch logs/test/custom-stress
+```
+
+Behavior:
+
+- JSON logs: shipped directly (no pipeline matching)
+- CEF logs: converted and shipped directly
+- Other logs: matcher shortlists candidates and validates with ES `_simulate`
+- If no good match: script asks before running local LLM to generate a pipeline
+- Generated pipelines are cached in `pipelines/generated/`
+- If matched pipeline quality is poor (`0` indexed or high parser errors), script auto-falls back to LLM generation
+
+Notes:
+
+- Pipeline matching is best-effort and intentionally generic (not hardcoded for every vendor variant)
+- A matched pipeline can still produce partial parse errors on noisy/synthetic logs; check `error.message` and `parse_error` counts when validating quality
+- The local generator lives in `scripts/pipeline_generator.py`
+
+Flags:
+
+- `--keep`: keep existing target index data (no delete)
+- `--now`: for matched text pipelines, rewrites `@timestamp` to ingest time while preserving original event time in `event.created`
+- `--type <name|family>`: choose exact pipeline or family menu (capped list + autodiscover option)
+- `--batch <dir>`: treat directory as same log family; first file determines strategy and remaining files reuse it
+
+On low-RAM systems (e.g. 16 GB), LLM generation temporarily pauses non-essential containers and resumes them afterward.
 
 ## Stop / Reset
 

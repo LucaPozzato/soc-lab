@@ -1,22 +1,25 @@
 #!/bin/bash
 set -e
 
-# Parse args — accept pcap path and optional -now flag in any order
+# Parse args — accept pcap path and optional flags in any order
 NOW_MODE=false
+KEEP=false
 PCAP_FILE=""
 for arg in "$@"; do
   case "$arg" in
-    -now) NOW_MODE=true ;;
-    *)    PCAP_FILE="$arg" ;;
+    --now)  NOW_MODE=true ;;
+    --keep) KEEP=true ;;
+    *)      PCAP_FILE="$arg" ;;
   esac
 done
 
 if [ -z "$PCAP_FILE" ]; then
-  echo "Usage: ./replay-pcap.sh <pcap-file> [-now]"
+  echo "Usage: ./replay-pcap.sh <pcap-file> [--now] [--keep]"
   echo ""
-  echo "  -now   Shift all event timestamps to now (optional)."
-  echo "         Without -now, original packet timestamps are preserved and"
-  echo "         alert timestamps are automatically corrected to match."
+  echo "  --now    Shift all event timestamps to now (optional)."
+  echo "           Without --now, original packet timestamps are preserved."
+  echo "  --keep   Preserve existing Suricata/ElastAlert2 data in ES."
+  echo "           Without --keep, previous replay data is wiped first."
   echo ""
   echo "Files available:"
   ls ./pcap/*.pcap 2>/dev/null || echo "  (none found)"
@@ -35,20 +38,25 @@ echo " Replaying: $PCAP_NAME"
 [ "$NOW_MODE" = "true" ] && echo " Timestamps: shifted to now"
 echo "======================================"
 
-echo "[*] Clearing previous logs and indices..."
-curl -s "http://localhost:9200/_cat/indices/suricata-*?h=index" | \
-  xargs -I{} curl -s -X DELETE "http://localhost:9200/{}" >/dev/null
-# Delete documents but keep indices — dropping them causes ElastAlert2 to
-# error on missing mappings. Silence must also be cleared so the rule can
-# re-fire after a replay. ElastAlert2 is restarted so its in-memory scan
-# window resets; clearing the status index alone doesn't work while it runs.
-DQ='{"query":{"match_all":{}}}'
-for idx in elastalert2_alerts elastalert2_alerts_status elastalert2_alerts_silence; do
-  curl -s -X POST "http://localhost:9200/${idx}/_delete_by_query" \
-      -H 'Content-Type: application/json' -d "$DQ" >/dev/null 2>&1 || true
-done
-docker stop filebeat elastalert2 >/dev/null
-docker exec suricata sh -c 'rm -f /var/log/suricata/eve.json /var/log/suricata/suricata.log'
+if [ "$KEEP" = "false" ]; then
+  echo "[*] Clearing previous logs and indices..."
+  curl -s "http://localhost:9200/_cat/indices/suricata-*?h=index" | \
+    xargs -I{} curl -s -X DELETE "http://localhost:9200/{}" >/dev/null
+  # Delete documents but keep indices — dropping them causes ElastAlert2 to
+  # error on missing mappings. Silence must also be cleared so the rule can
+  # re-fire after a replay. ElastAlert2 is restarted so its in-memory scan
+  # window resets; clearing the status index alone doesn't work while it runs.
+  DQ='{"query":{"match_all":{}}}'
+  for idx in elastalert2_alerts elastalert2_alerts_status elastalert2_alerts_silence; do
+    curl -s -X POST "http://localhost:9200/${idx}/_delete_by_query" \
+        -H 'Content-Type: application/json' -d "$DQ" >/dev/null 2>&1 || true
+  done
+  docker stop filebeat elastalert2 >/dev/null
+  docker exec suricata sh -c 'rm -f /var/log/suricata/eve.json /var/log/suricata/suricata.log'
+else
+  echo "[*] Keeping existing data (--keep)..."
+  docker stop filebeat elastalert2 >/dev/null
+fi
 
 echo "[*] Sending pcap to Suricata..."
 docker exec suricata suricata \
@@ -64,7 +72,7 @@ if [ "$NOW_MODE" = "true" ]; then
 import json
 from datetime import datetime, timezone, timedelta
 
-eve = "logs/suricata/eve.json"
+eve = "docker-logs/suricata/eve.json"
 TS_FMT = "%Y-%m-%dT%H:%M:%S.%f+0000"
 
 events = []

@@ -254,10 +254,138 @@ This means a single query to `soc-alerts` returns both raw IDS alerts from Suric
 
 **How it's kept alive across resets:**
 
-- `start.sh` creates a Kibana data view called "Alerts" pointing at `soc-alerts`, alongside the existing `suricata-*` and `elastalert2_alerts` views.
+- `docker.sh start` creates a Kibana data view called "Alerts" pointing at `soc-alerts`, alongside the existing `suricata-*` and `elastalert2_alerts` views.
 - An ES index template `suricata-soc-alerts` auto-applies the alias+filter to every new `suricata-*` index when it's created by Filebeat, so the alias survives volume wipes and fresh index creation.
 - `replay-pcap.sh` re-PUTs the template before starting Filebeat, ensuring the template is present even after a full `docker compose down -v`.
 - `elastalert-start.sh` re-attaches `elastalert2_alerts` to `soc-alerts` after `elastalert-create-index` runs (which drops all aliases as a side effect).
+
+---
+
+## `upload-logs.sh` — Generic log ingest workflow
+
+`upload-logs.sh` is intentionally separate from the Suricata replay path. It is a generic parser/uploader for arbitrary log files.
+
+### Decision flow
+
+1. **Format detect**
+   - JSON line logs → ship directly
+   - CEF logs → convert to JSON, then ship directly
+   - Other text logs → run pipeline matching
+
+2. **Pipeline matching (text logs)**
+   - `scripts/match_pipeline.py` scores candidates using lightweight structure hints and grok pre-score
+   - It simulates a short list against ES `_ingest/pipeline/_simulate`
+   - Best candidate is picked by extraction quality and low errors
+
+3. **No-match fallback**
+   - If no reliable candidate is found, user is prompted to approve local LLM pipeline generation
+   - LLM output is validated via `_simulate` before use
+   - Successful generated pipelines are cached under `pipelines/generated/`
+
+### End-to-end details (what the script actually does)
+
+1. **Input normalization and target naming**
+   - Derives a base name from the file (for example `custom-kv.log` → `custom-kv`)
+   - Builds target index pattern `logs-<base>-*` and daily write index `logs-<base>-YYYY.MM.DD`
+   - Unless `--keep` is set, deletes existing `logs-<base>-*` indices first for a clean run
+
+2. **Format detection path**
+   - **JSON lines**: sends as-is with bulk ingest helpers (no pipeline matching)
+   - **CEF**: converts CEF fields to JSON and ingests directly (no pipeline matching)
+   - **Plain text / mixed text**: runs matcher+simulate selection path
+
+3. **Matcher shortlisting (`scripts/match_pipeline.py`)**
+   - Reads a sample of lines from the file (not the full file)
+   - Applies lightweight structure hints (prefixes/tokens known to correlate with pipeline families)
+   - Computes a preliminary quality score so only the top-N candidates are simulated (currently small N for speed)
+
+4. **Elasticsearch simulate ranking**
+   - Calls `POST /_ingest/pipeline/_simulate` with sampled docs for each candidate
+   - Captures per-candidate metrics (success rate, parse errors, extracted field richness)
+   - Picks the best candidate by quality score and low error rate; if all weak, returns no-match
+
+5. **Pipeline load and safety transforms**
+   - Converts integration YAML pipeline files into JSON processors for ES ingest API
+   - Strips unresolved Fleet sub-pipeline template references that cannot run standalone
+   - Uploads/updates pipeline in ES via ingest API before bulk indexing
+
+6. **LLM fallback (`scripts/pipeline_generator.py`)**
+   - Triggered only after explicit prompt approval
+   - Uses sampled lines to generate a Grok-oriented pipeline candidate
+   - Validates via `_simulate`; retries on weak patterns or parse failures
+   - Saves successful pipeline to `pipelines/generated/llm-<base>.yml` and reuses later if still valid
+
+7. **Post-ingest quality guard (text logs)**
+   - After ingesting with a matched pipeline, the script refreshes the index and checks quality metrics:
+     - total indexed docs
+     - `error.message` count
+     - `parse_error` count
+   - It keeps the matched pipeline when quality is acceptable.
+   - It automatically retries with LLM pipeline generation when quality is poor (for example, zero indexed docs or high parser error ratio).
+
+8. **Timestamp behavior**
+   - For matched text pipelines, `--now` wraps output so:
+     - original parsed event time is copied to `event.created`
+     - `@timestamp` is replaced with ingest time
+   - Without `--now`, event-time `@timestamp` from parsing is preserved
+
+9. **Result reporting**
+   - Prints selected pipeline mode (`matched`, `llm`, or `none/raw`)
+   - Prints final target index and indexed document count
+   - Creates/updates Kibana data view for the target pattern when Kibana is reachable
+
+### Who actually ships logs in this path?
+
+For `upload-logs.sh`, **the script itself ships documents directly to Elasticsearch**. Filebeat is not in this path.
+
+- The script builds NDJSON bulk payloads (`{"create":...}` action line + document line).
+- It sends them to `POST /_bulk` using `curl`.
+- If a pipeline is selected/generated, it adds `?pipeline=<pipeline_name>` to the same bulk request.
+- Elasticsearch executes ingest processors server-side before indexing each document.
+
+So the upload path is:
+
+1. local file -> read/normalize by `upload-logs.sh`
+2. optional pipeline selection/generation
+3. `upload-logs.sh` sends `_bulk` requests directly to ES
+4. ES ingest node runs pipeline processors and indexes docs
+5. Kibana reads indexed docs from ES
+
+By contrast, in the Suricata replay path, Filebeat tails `eve.json` and ships those logs. That is a separate ingest path.
+
+### Performance and RAM behavior
+
+LLM generation is the expensive path. On constrained hosts (e.g. 16 GB RAM), the script pauses non-essential containers (`kibana`, `suricata`, `filebeat`, `elastalert2`) while generating and resumes them after generation.
+
+This is done to free memory for local model inference and reduce swap pressure. The pause window only affects visibility/shipping during generation; ingest resumes normally once containers restart.
+
+### `--type` behavior
+
+- `--type <exact>`: use exact pipeline
+- `--type <family>`: menu of family pipelines (capped to 10 choices) plus autodiscover-in-family
+
+If family autodiscover is chosen, matching is restricted to that family prefix before simulate ranking, which is often more reliable than global autodiscover when you already know the vendor/source.
+
+### `--batch` behavior
+
+- `--batch <dir>` processes all files in a directory.
+- The first file determines strategy (matched pipeline, LLM pipeline, or raw).
+- Remaining files in that directory reuse that strategy to reduce repeated matching overhead.
+
+### `--keep` / `--now`
+
+- Without `--keep`, the target index pattern is deleted before ingest
+- With `--keep`, new docs are appended
+- `--now` wraps matched text pipelines so `@timestamp` is set to ingest time and original parsed time is copied to `event.created`
+
+### Practical limitations (important)
+
+- Pipeline matching is probabilistic, not perfect classification.
+- Even a good pipeline can partially fail on synthetic or heavily customized lines.
+- For quality checks after ingest, query:
+  - `error.message:*` (ingest processor errors)
+  - `parse_error:*` (explicit parser fallback/error tagging)
+- If those rates are high, use `--type <family>` / exact `--type`, or accept LLM fallback generation.
 
 ---
 
@@ -456,7 +584,9 @@ docker exec suricata suricata \
 
 This runs Suricata **synchronously inside the already-running container**. It reads the PCAP, runs every packet through all loaded rules, writes eve.json, then exits. The `exec` call blocks until Suricata finishes — so the next line only runs after all events are written.
 
-**`-now` flag (optional):** When passed, a Python script reads the completed `eve.json`, finds the earliest timestamp, and shifts all event timestamps forward so the earliest event lands at the current time. Relative timing between events is preserved. This is useful when you want Kibana's default "last 15 minutes" view to show the replay events without manually adjusting the time range.
+**`--now` flag (optional):** When passed, a Python script reads the completed `eve.json`, finds the earliest timestamp, and shifts all event timestamps forward so the earliest event lands at the current time. Relative timing between events is preserved. This is useful when you want Kibana's default "last 15 minutes" view to show the replay events without manually adjusting the time range.
+
+**`--keep` flag (optional):** Skips the cleanup phase and appends new replayed events/alerts to existing data. Without `--keep`, replay runs are clean-slate by default (old Suricata indices are removed and ElastAlert2 writeback docs are cleared before replay).
 
 ```bash
 docker start filebeat elastalert2

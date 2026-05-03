@@ -42,7 +42,7 @@ services:
       - ./scripts/suricata-start.sh:/suricata-start.sh:ro
       - ./config/suricata/suricata.yaml:/etc/suricata/suricata.yaml
       - ./config/suricata/threshold.config:/etc/suricata/threshold.config
-      - ./logs/suricata:/var/log/suricata
+      - ./docker-logs/suricata:/var/log/suricata
       - ./pcap:/pcap:ro
       - ./rules/suricata:/etc/suricata/rules/custom
       - suricata_rules:/var/lib/suricata/rules
@@ -56,7 +56,7 @@ services:
     user: root
     volumes:
       - ./config/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
-      - ./logs/suricata:/var/log/suricata:ro
+      - ./docker-logs/suricata:/var/log/suricata:ro
       - filebeat_data:/usr/share/filebeat/data
     depends_on:
       elasticsearch:
@@ -76,6 +76,19 @@ services:
       elasticsearch:
         condition: service_healthy
     entrypoint: ["/bin/sh", "/elastalert-start.sh"]
+
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    profiles: ["llm"]
+    volumes:
+      - ./models/ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
 
 volumes:
   es_data:
