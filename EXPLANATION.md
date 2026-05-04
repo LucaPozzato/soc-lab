@@ -270,17 +270,17 @@ This means a single query to `soc-alerts` returns both raw IDS alerts from Suric
 1. **Format detect**
    - JSON line logs → ship directly
    - CEF logs → convert to JSON, then ship directly
-   - Other text logs → run pipeline matching
+   - Other text logs → require explicit mode: `--type` or `--build-pipeline`
 
-2. **Pipeline matching (text logs)**
-   - `scripts/match_pipeline.py` scores candidates using lightweight structure hints and grok pre-score
-   - It simulates a short list against ES `_ingest/pipeline/_simulate`
-   - Best candidate is picked by extraction quality and low errors
+2. **Explicit pipeline mode (`--type`)**
+   - Accepts a pipeline name in Elasticsearch or a local YAML path
+   - Local resolution checks `pipelines/elasticsearch/`, `pipelines/custom/`, and `pipelines/generated/`
+   - YAML is loaded into Elasticsearch ingest before indexing
 
-3. **No-match fallback**
-   - If no reliable candidate is found, user is prompted to approve local LLM pipeline generation
-   - LLM output is validated via `_simulate` before use
-   - Successful generated pipelines are cached under `pipelines/generated/`
+3. **Build mode (`--build-pipeline`)**
+   - Requires local bare-metal Ollama at `http://localhost:11434`
+   - Uses LLM-generated Grok pipeline with closed-loop retries
+   - Output is validated via `_simulate` before use (unless `--llm-ram-mode quit-docker`) and cached in `pipelines/generated/`
 
 ### End-to-end details (what the script actually does)
 
@@ -290,47 +290,23 @@ This means a single query to `soc-alerts` returns both raw IDS alerts from Suric
    - Unless `--keep` is set, deletes existing `logs-<base>-*` indices first for a clean run
 
 2. **Format detection path**
-   - **JSON lines**: sends as-is with bulk ingest helpers (no pipeline matching)
-   - **CEF**: converts CEF fields to JSON and ingests directly (no pipeline matching)
-   - **Plain text / mixed text**: runs matcher+simulate selection path
+   - **JSON lines**: sends as-is with bulk ingest helpers
+   - **CEF**: converts CEF fields to JSON and ingests directly
+   - **Plain text / mixed text**: requires `--type` or `--build-pipeline`
 
-3. **Matcher shortlisting (`scripts/match_pipeline.py`)**
-   - Reads a sample of lines from the file (not the full file)
-   - Applies lightweight structure hints (prefixes/tokens known to correlate with pipeline families)
-   - Computes a preliminary quality score so only the top-N candidates are simulated (currently small N for speed)
+3. **Pipeline load and validation**
+   - For `--type`, loads named/local YAML pipeline into Elasticsearch if needed
+   - For `--build-pipeline`, generates pipeline using `scripts/pipeline_generator.py`
+   - Validates generated parser via `_simulate` before indexing
 
-4. **Elasticsearch simulate ranking**
-   - Calls `POST /_ingest/pipeline/_simulate` with sampled docs for each candidate
-   - Captures per-candidate metrics (success rate, parse errors, extracted field richness)
-   - Picks the best candidate by quality score and low error rate; if all weak, returns no-match
+4. **Timestamp behavior**
+   - For text pipelines, `--now` wraps output so:
+      - original parsed event time is copied to `event.created`
+      - `@timestamp` is replaced with ingest time
+    - Without `--now`, event-time `@timestamp` from parsing is preserved
 
-5. **Pipeline load and safety transforms**
-   - Converts integration YAML pipeline files into JSON processors for ES ingest API
-   - Strips unresolved Fleet sub-pipeline template references that cannot run standalone
-   - Uploads/updates pipeline in ES via ingest API before bulk indexing
-
-6. **LLM fallback (`scripts/pipeline_generator.py`)**
-   - Triggered only after explicit prompt approval
-   - Uses sampled lines to generate a Grok-oriented pipeline candidate
-   - Validates via `_simulate`; retries on weak patterns or parse failures
-   - Saves successful pipeline to `pipelines/generated/llm-<base>.yml` and reuses later if still valid
-
-7. **Post-ingest quality guard (text logs)**
-   - After ingesting with a matched pipeline, the script refreshes the index and checks quality metrics:
-     - total indexed docs
-     - `error.message` count
-     - `parse_error` count
-   - It keeps the matched pipeline when quality is acceptable.
-   - It automatically retries with LLM pipeline generation when quality is poor (for example, zero indexed docs or high parser error ratio).
-
-8. **Timestamp behavior**
-   - For matched text pipelines, `--now` wraps output so:
-     - original parsed event time is copied to `event.created`
-     - `@timestamp` is replaced with ingest time
-   - Without `--now`, event-time `@timestamp` from parsing is preserved
-
-9. **Result reporting**
-   - Prints selected pipeline mode (`matched`, `llm`, or `none/raw`)
+5. **Result reporting**
+   - Prints selected pipeline mode (`named`, `generated`, or `none`)
    - Prints final target index and indexed document count
    - Creates/updates Kibana data view for the target pattern when Kibana is reachable
 
@@ -355,37 +331,37 @@ By contrast, in the Suricata replay path, Filebeat tails `eve.json` and ships th
 
 ### Performance and RAM behavior
 
-LLM generation is the expensive path. On constrained hosts (e.g. 16 GB RAM), the script pauses non-essential containers (`kibana`, `suricata`, `filebeat`, `elastalert2`) while generating and resumes them after generation.
+LLM generation is the expensive path. Use a local 7B-class Ollama model on bare metal for the best balance of quality and latency.
 
-This is done to free memory for local model inference and reduce swap pressure. The pause window only affects visibility/shipping during generation; ingest resumes normally once containers restart.
+`--llm-ram-mode` controls behavior during generation:
+
+- `none` (default): keep Docker/lab up and validate generated pipeline against Elasticsearch `_simulate`
+- `quit-docker`: stop Docker before generation (no ES validation during generation), then start Docker and wait for lab recovery before ingest
 
 ### `--type` behavior
 
-- `--type <exact>`: use exact pipeline
-- `--type <family>`: menu of family pipelines (capped to 10 choices) plus autodiscover-in-family
-
-If family autodiscover is chosen, matching is restricted to that family prefix before simulate ranking, which is often more reliable than global autodiscover when you already know the vendor/source.
+- `--type <name>`: use exact pipeline name (Elasticsearch or local pipeline folders)
+- `--type <path.yml>`: use explicit local YAML pipeline path
 
 ### `--batch` behavior
 
-- `--batch <dir>` processes all files in a directory.
-- The first file determines strategy (matched pipeline, LLM pipeline, or raw).
-- Remaining files in that directory reuse that strategy to reduce repeated matching overhead.
+- `--batch --folder <dir>` processes all files in a directory.
+- Batch mode expects same log type per folder; mixed file extensions are flagged with a warning.
+- With `--build-pipeline`, first text file is used to generate one pipeline and remaining files reuse it.
 
 ### `--keep` / `--now`
 
 - Without `--keep`, the target index pattern is deleted before ingest
 - With `--keep`, new docs are appended
-- `--now` wraps matched text pipelines so `@timestamp` is set to ingest time and original parsed time is copied to `event.created`
+- `--now` wraps text pipelines so `@timestamp` is set to ingest time and original parsed time is copied to `event.created`
 
 ### Practical limitations (important)
 
-- Pipeline matching is probabilistic, not perfect classification.
 - Even a good pipeline can partially fail on synthetic or heavily customized lines.
 - For quality checks after ingest, query:
   - `error.message:*` (ingest processor errors)
   - `parse_error:*` (explicit parser fallback/error tagging)
-- If those rates are high, use `--type <family>` / exact `--type`, or accept LLM fallback generation.
+- If those rates are high, prefer a custom `--type <path.yml>` parser for that log source.
 
 ---
 

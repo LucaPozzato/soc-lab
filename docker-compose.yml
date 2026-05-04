@@ -77,19 +77,6 @@ services:
         condition: service_healthy
     entrypoint: ["/bin/sh", "/elastalert-start.sh"]
 
-  ollama:
-    image: ollama/ollama
-    container_name: ollama
-    profiles: ["llm"]
-    volumes:
-      - ./models/ollama:/root/.ollama
-    ports:
-      - "11434:11434"
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-
 volumes:
   es_data:
   filebeat_data:

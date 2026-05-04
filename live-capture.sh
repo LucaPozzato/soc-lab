@@ -42,9 +42,9 @@ log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 cleanup() {
     echo ""
-    log "Stopping live capture..."
-    [ -n "${TCPDUMP_PID:-}" ] && sudo kill "$TCPDUMP_PID" 2>/dev/null || true
-    wait "${TCPDUMP_PID:-}" 2>/dev/null || true
+    log "Stopping capture..."
+    [ -n "${CAPTURE_PID:-}" ] && kill "$CAPTURE_PID" 2>/dev/null || true
+    wait "${CAPTURE_PID:-}" 2>/dev/null || true
     log "Stopped. Events from this session remain in Kibana."
     exit 0
 }
@@ -71,21 +71,26 @@ else
 fi
 docker start filebeat >/dev/null
 
-# ---- start tcpdump ----
-log "Starting tcpdump (may prompt for sudo password)..."
-sudo tcpdump -i "$INTERFACE" \
-    -G "$ROTATION_SECS" \
-    -w "$PCAP_DIR/capture_%Y%m%d_%H%M%S.pcap" \
-    2>/dev/null &
-TCPDUMP_PID=$!
-
 echo ""
 log "Capturing on $INTERFACE, rotating every ${ROTATION_SECS}s."
 log "Kibana: http://localhost:5601  |  Ctrl+C to stop"
 echo ""
 
+# ---- capture loop (background) ----
+# -G exits after one rotation on WSL — restart immediately to minimise gap.
+capture_loop() {
+    while true; do
+        sudo tcpdump -i "$INTERFACE" \
+            -G "$ROTATION_SECS" \
+            -w "$PCAP_DIR/capture_%Y%m%d_%H%M%S.pcap" \
+            2>/dev/null || true
+    done
+}
+capture_loop &
+CAPTURE_PID=$!
+
 # ---- watch loop ----
-while kill -0 "$TCPDUMP_PID" 2>/dev/null; do
+while kill -0 "$CAPTURE_PID" 2>/dev/null; do
     pcaps=()
     while IFS= read -r f; do pcaps+=("$f"); done < <(ls -t "$PCAP_DIR"/capture_*.pcap 2>/dev/null || true)
 
@@ -110,4 +115,4 @@ while kill -0 "$TCPDUMP_PID" 2>/dev/null; do
     sleep 2
 done
 
-log "tcpdump exited."
+log "Capture process exited."

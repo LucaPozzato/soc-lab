@@ -26,12 +26,32 @@ if [ -z "$PCAP_FILE" ]; then
   exit 1
 fi
 
-PCAP_NAME=$(basename "$PCAP_FILE")
+PCAP_DIR="$(cd "$(dirname "$0")/pcap" && pwd)"
 
-if [ ! -f "$PCAP_FILE" ]; then
-  echo "ERROR: $PCAP_FILE not found"
+if [[ "$PCAP_FILE" == /* ]]; then
+  PCAP_ABS="$PCAP_FILE"
+elif [[ "$PCAP_FILE" == pcap/* ]]; then
+  PCAP_ABS="$(cd "$(dirname "$0")" && pwd)/$PCAP_FILE"
+elif [[ "$PCAP_FILE" == ./pcap/* ]]; then
+  PCAP_ABS="$(cd "$(dirname "$0")" && pwd)/${PCAP_FILE#./}"
+else
+  PCAP_ABS="$PCAP_DIR/$PCAP_FILE"
+fi
+
+if [ ! -f "$PCAP_ABS" ]; then
+  echo "ERROR: $PCAP_ABS not found"
   exit 1
 fi
+
+PCAP_ABS="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$PCAP_ABS")"
+PCAP_DIR_REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$PCAP_DIR")"
+if [[ "$PCAP_ABS" != "$PCAP_DIR_REAL"/* ]]; then
+  echo "ERROR: PCAP must be inside ./pcap (subdirectories are allowed)"
+  exit 1
+fi
+
+PCAP_REL="${PCAP_ABS#$PCAP_DIR_REAL/}"
+PCAP_NAME="$(basename "$PCAP_ABS")"
 
 echo "======================================"
 echo " Replaying: $PCAP_NAME"
@@ -61,7 +81,7 @@ fi
 echo "[*] Sending pcap to Suricata..."
 docker exec suricata suricata \
   -c /etc/suricata/suricata.yaml \
-  -r /pcap/$PCAP_NAME \
+  -r /pcap/$PCAP_REL \
   --pidfile /var/run/suricata-replay.pid \
   -l /var/log/suricata \
   -k none

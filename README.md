@@ -206,35 +206,41 @@ Suricata rule syntax reference: https://docs.suricata.io/en/latest/rules/index.h
 Use this when ingesting non-Suricata logs into Elasticsearch:
 
 ```bash
-./upload-logs.sh logs/test/syslog.log
+./upload-logs.sh logs/test/syslog.log --build-pipeline
 ./upload-logs.sh logs/test/cisco-asa.log --type cisco
+./upload-logs.sh logs/test/custom.log --type pipelines/custom/my-parser.yml
 ./upload-logs.sh logs/test/apache-access.log --type apache-access --now
-./upload-logs.sh --batch logs/test/custom-stress
+./upload-logs.sh --batch --folder logs/test/custom-stress --build-pipeline
 ```
 
 Behavior:
 
 - JSON logs: shipped directly (no pipeline matching)
 - CEF logs: converted and shipped directly
-- Other logs: matcher shortlists candidates and validates with ES `_simulate`
-- If no good match: script asks before running local LLM to generate a pipeline
+- Other logs: require explicit mode (`--type` or `--build-pipeline`)
+- `--type`: uses pipeline from Elasticsearch, `pipelines/elasticsearch/`, `pipelines/custom/`, or `pipelines/generated/`
+- `--build-pipeline`: generates a parser with local bare-metal Ollama (7B preferred) and validates it against Elasticsearch (unless `--llm-ram-mode quit-docker`)
 - Generated pipelines are cached in `pipelines/generated/`
-- If matched pipeline quality is poor (`0` indexed or high parser errors), script auto-falls back to LLM generation
 
 Notes:
 
-- Pipeline matching is best-effort and intentionally generic (not hardcoded for every vendor variant)
-- A matched pipeline can still produce partial parse errors on noisy/synthetic logs; check `error.message` and `parse_error` counts when validating quality
+- No automatic pipeline matching is performed
 - The local generator lives in `scripts/pipeline_generator.py`
 
 Flags:
 
 - `--keep`: keep existing target index data (no delete)
 - `--now`: for matched text pipelines, rewrites `@timestamp` to ingest time while preserving original event time in `event.created`
-- `--type <name|family>`: choose exact pipeline or family menu (capped list + autodiscover option)
-- `--batch <dir>`: treat directory as same log family; first file determines strategy and remaining files reuse it
+- `--type <name|path.yml>`: use exact pipeline name or direct YAML path
+- `--build-pipeline`: auto-build parser locally (requires local Ollama running at `http://localhost:11434`)
+- `--batch --folder <dir>`: process all files in directory with one selected/generated text pipeline
+- `--llm-ram-mode <none|quit-docker>`: memory behavior during `--build-pipeline` (default `none`; `quit-docker` disables ES validation during generation, then cycles Docker and waits for lab recovery before ingest)
 
-On low-RAM systems (e.g. 16 GB), LLM generation temporarily pauses non-essential containers and resumes them afterward.
+Batch note:
+
+- Put same log family in one folder; mixed file extensions are flagged with a warning.
+
+`--build-pipeline` requires a local bare-metal Ollama instance reachable at `http://localhost:11434`.
 
 ## Stop / Reset
 
