@@ -12,10 +12,26 @@ Personal security lab for testing Suricata IDS detection and whitelist rules via
 | filebeat | elastic/filebeat:8.13.0 | Ships suricata logs to ES |
 | elastalert2 | jertel/elastalert2:latest | Alerting — converts Sigma rules, fires on ES matches |
 
+## Install
+
+Run once per machine/repo clone to bootstrap local dependencies:
+
+```bash
+./soc-lab stack install
+```
+
 ## Quick Start
+
+Start the stack:
 
 ```bash
 ./soc-lab stack start
+```
+
+Verify health:
+
+```bash
+./soc-lab health check
 ```
 
 ## CLI Modes
