@@ -10,22 +10,23 @@ info() { echo -e "[*] $*"; }
 ES_URL="http://localhost:9200"
 OLLAMA_URL="http://localhost:11434"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PIPELINES_ES="$SCRIPT_DIR/pipelines/elasticsearch"
-PIPELINES_CUSTOM="$SCRIPT_DIR/pipelines/custom"
-PIPELINES_GEN="$SCRIPT_DIR/pipelines/generated"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+PIPELINES_ES="$REPO_ROOT/pipelines/elasticsearch"
+PIPELINES_CUSTOM="$REPO_ROOT/pipelines/custom"
+PIPELINES_GEN="$REPO_ROOT/pipelines/generated"
 BULK_SIZE=500
 LLM_RAM_MODE="${LLM_RAM_MODE:-none}"
 
-VENV="$SCRIPT_DIR/.venv"
-[ -f "$VENV/bin/activate" ] || bash "$SCRIPT_DIR/scripts/setup-venv.sh"
+VENV="$REPO_ROOT/.venv"
+[ -f "$VENV/bin/activate" ] || bash "$REPO_ROOT/scripts/tools/setup-venv.sh"
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 
 usage() {
     cat <<'EOF'
 Usage:
-  ./upload-logs.sh <file> (--type <pipeline>|--build-pipeline) [--index <name>] [--keep] [--now] [--llm-ram-mode <mode>]
-  ./upload-logs.sh --batch --folder <dir> (--type <pipeline>|--build-pipeline) [--index <prefix>] [--keep] [--now] [--llm-ram-mode <mode>]
+  ./soc-lab capture upload <file> (--type <pipeline>|--build-pipeline) [--index <name>] [--keep] [--now] [--llm-ram-mode <mode>]
+  ./soc-lab capture upload --batch --folder <dir> (--type <pipeline>|--build-pipeline) [--index <prefix>] [--keep] [--now] [--llm-ram-mode <mode>]
 
 Notes:
   - For text logs, you must choose exactly one mode: --type or --build-pipeline.
@@ -289,8 +290,8 @@ pipeline_file_for_type() {
             python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$t"
             return 0
         fi
-        if [[ -f "$SCRIPT_DIR/$t" ]]; then
-            python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$SCRIPT_DIR/$t"
+        if [[ -f "$REPO_ROOT/$t" ]]; then
+            python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$REPO_ROOT/$t"
             return 0
         fi
         return 1
@@ -406,7 +407,7 @@ docker_restore_after_generation() {
     docker info >/dev/null 2>&1 || return 1
 
     info "Waiting for SOC lab services..." >&2
-    bash "$SCRIPT_DIR/docker.sh" start >/dev/null 2>&1 || true
+    bash "$REPO_ROOT/soc-lab" --cli stack start >/dev/null 2>&1 || true
     for i in $(seq 1 120); do
         curl -sf "$ES_URL/_cluster/health" >/dev/null 2>&1 && { ok "Docker/Lab recovered" >&2; return 0; }
         sleep 2
@@ -511,7 +512,7 @@ generate_pipeline_ai() {
     pause_for_llm
     local validate_flag="true"
     [[ "$LLM_RAM_MODE" == "quit-docker" ]] && validate_flag="false"
-    if ! PIPELINE_GEN_VALIDATE_ES="$validate_flag" python3 "$SCRIPT_DIR/scripts/pipeline_generator.py" "$samples" "$pipeline_name" "$model" > "$llm_out"; then
+    if ! PIPELINE_GEN_VALIDATE_ES="$validate_flag" python3 "$REPO_ROOT/scripts/tools/pipeline_generator.py" "$samples" "$pipeline_name" "$model" > "$llm_out"; then
         resume_after_llm
         rm -f "$samples" "$llm_out"
         die "LLM pipeline generation failed"

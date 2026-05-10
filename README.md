@@ -15,8 +15,43 @@ Personal security lab for testing Suricata IDS detection and whitelist rules via
 ## Quick Start
 
 ```bash
-./docker.sh start
+./soc-lab stack start
 ```
+
+## CLI Modes
+
+`soc-lab` has two execution modes:
+
+- Interactive shell mode (default):
+
+```bash
+./soc-lab
+```
+
+- One-shot command mode (automation-friendly):
+
+```bash
+./soc-lab stack status
+./soc-lab capture replay <pcap>
+```
+
+Inside interactive mode, type raw commands (without the `soc-lab` prefix), for example `stack start`, `health check`, `capture replay <pcap>`.
+
+Bubble Tea preview (in development):
+
+```bash
+./soc-lab tui-bt
+```
+
+Requires Go 1.22+ installed locally.
+
+Bubble Tea highlights:
+
+- Live streaming command output (stdout/stderr) while commands run
+- In-TUI confirmations for destructive actions (`stack reset`, `stack uninstall`)
+- File completion scoped by command context (`pcap/` for replay, `logs/` + `pipelines/` for upload)
+- Activity bar under header with state, command, last duration, and exit code
+- Focus mode toggle (`f`) to hide header and prioritize output
 
 On first run, Suricata downloads ~43k Emerging Threats community rules (~1-2 minutes). Rules persist across restarts.
 
@@ -24,13 +59,41 @@ On first run, Suricata downloads ~43k Emerging Threats community rules (~1-2 min
 
 Suricata events are parsed with Security Onion (SO) ingest pipelines and ECS component templates, loaded at startup.
 
-- `docker.sh start` runs `load-so-templates.sh` and `load-so-pipelines.sh` after Elasticsearch is healthy
+- `soc-lab stack start` runs SO template/pipeline sync after Elasticsearch is healthy
 - Filebeat writes to `suricata-%{+yyyy.MM.dd}` with ingest pipeline `suricata.common`
 - `suricata.common` dispatches by event type; `suricata.alert` is patched to also dispatch by `app_proto` when available
 - Alert docs are forced to `event.dataset: suricata.alert` and stay in `suricata-*` (no alert index override)
 - `suricata-so-ecs` template composes SO ECS components and sets `index.mapping.total_fields.limit: 5000`
 
 This keeps broad event coverage (dns/http/tls/flow/quic/alert/etc.) while preserving SO-native parsing behavior.
+
+### Ingest flow (Suricata + SO pipelines)
+
+```text
+pcap/traffic
+   |
+   v
+Suricata writes eve.json lines (raw event JSON)
+   |
+   v
+Filebeat tails eve.json and forwards each line to Elasticsearch
+   |
+   v
+Elasticsearch runs ingest pipeline: suricata.common
+   |
+   +--> route to SO parser by event type/app_proto
+   |      (dns/http/tls/flow/alert/...)
+   |
+   v
+Parsed ECS document stored in suricata-YYYY.MM.DD
+   |
+   +--> Kibana reads suricata-* for hunting
+   |
+   +--> ElastAlert2 reads suricata-* and writes detections to elastalert2_alerts
+              |
+              v
+      soc-alerts alias combines Suricata IDS alerts + ElastAlert2 alerts
+```
 
 ## Directory Layout
 
@@ -43,10 +106,15 @@ config/
     elastalert2.yml           ElastAlert2 config (run interval, buffer window)
     rules/                    Hand-written ElastAlert2 rules (deployed directly)
 scripts/
-  suricata-start.sh           Container entrypoint: downloads rules on first run
-  elastalert-start.sh         Container entrypoint: converts Sigma rules, starts ElastAlert2
+  commands/                   CLI command handlers
+  lib/                        Shared shell helpers/logging
+  loaders/                    Security Onion template/pipeline loaders
+  runtime/                    Container entrypoints
+    suricata-start.sh         Downloads rules on first run, then waits for replay
+    elastalert-start.sh       Converts Sigma rules, starts ElastAlert2
+  tools/                      Upload tooling + venv bootstrap
 logs/
-  suricata/                   eve.json and suricata.log written here
+  suricata/                   Runtime logs written here
 pcap/                         Drop .pcap files here for replay
 rules/
   suricata/                   Custom Suricata .rules files (auto-loaded by Suricata)
@@ -57,21 +125,20 @@ rules/
 
 | Script | What it does |
 |---|---|
-| `docker.sh start` | Start stack, wait for healthy, load SO templates/pipelines, create ES data views |
-| `docker.sh stop` | Stop containers, keep volumes (ES data + rules) |
-| `docker.sh reset` | Stop containers and wipe all volumes |
-| `check-health.sh` | Container status, ES cluster health, recent log samples, ElastAlert2 alert count |
-| `replay-pcap.sh` | Replay a .pcap through Suricata |
-| `live-capture.sh` | Continuous tcpdump capture with auto-replay |
-| `reload-rules.sh` | Pull latest ET community rules, reload without restart |
-| `clean.sh` | Wipe ES indices, eve.json, and suricata.log for a clean slate |
-| `upload-logs.sh` | Upload arbitrary logs, auto-pick/LLM-generate ingest pipeline |
+| `soc-lab stack start` | Start stack, wait for healthy, load SO templates/pipelines, create ES data views |
+| `soc-lab stack stop` | Stop containers, keep volumes (ES data + rules) |
+| `soc-lab stack reset` | Stop containers and wipe all volumes |
+| `soc-lab health check` | Container status, ES cluster health, recent log samples, ElastAlert2 alert count |
+| `soc-lab capture replay` | Replay a .pcap through Suricata |
+| `soc-lab capture live` | Continuous tcpdump capture with auto-replay |
+| `soc-lab rules reload` | Pull latest ET community rules, reload without restart |
+| `soc-lab capture upload` | Upload arbitrary logs, optional explicit/LLM-generated ingest pipeline |
 
 ## PCAP Replay
 
 ```bash
-cp /path/to/capture.pcap ./pcap/
-./replay-pcap.sh pcap/capture.pcap
+cp /path/to/<capture-file>.pcap ./pcap/
+./soc-lab capture replay pcap/<capture-file>.pcap
 ```
 
 Each replay wipes previous Suricata events and all ElastAlert2 state (alerts, status, silence), then restarts ElastAlert2 so it rescans from scratch. Suricata events appear in Kibana under `suricata-*`; ElastAlert2 alerts under `elastalert2_alerts`. Both are combined in the `soc-alerts` unified alias (Kibana data view "Alerts"), which shows Suricata IDS alerts and ElastAlert2/Sigma fired alerts together in one place.
@@ -81,8 +148,8 @@ Replay also re-applies the `suricata-soc-alerts` template and re-attaches the `s
 The optional `-now` flag shifts all event timestamps to the current time while preserving relative timing:
 
 ```bash
-./replay-pcap.sh pcap/capture.pcap --now
-./replay-pcap.sh pcap/capture.pcap --keep
+./soc-lab capture replay pcap/<capture-file>.pcap --now
+./soc-lab capture replay pcap/<capture-file>.pcap --keep
 ```
 
 Without `-now`, original PCAP timestamps are preserved and Kibana shows events at their original capture time.
@@ -104,9 +171,9 @@ Alerts are stored in the `elastalert2_alerts` index in Elasticsearch. The `@time
 Captures traffic via tcpdump on a macOS interface, rotates PCAPs, and auto-replays each one through Suricata.
 
 ```bash
-./live-capture.sh              # capture on en0, rotate every 10s
-./live-capture.sh lo0 30       # loopback interface, rotate every 30s
-./live-capture.sh -h           # full usage
+./soc-lab capture live              # capture on en0, rotate every 10s
+./soc-lab capture live lo0 30       # loopback interface, rotate every 30s
+./soc-lab capture live -h           # full usage
 ```
 
 - Each session starts fresh (ES indices and eve.json cleared)
@@ -161,7 +228,7 @@ Rules matching `$HOME_NET → $EXTERNAL_NET` will fire.
 python3 -m http.server 8080 --bind 127.0.1.1
 
 # Capture and replay loopback traffic
-./live-capture.sh lo0 30
+./soc-lab capture live lo0 30
 
 # In another terminal, generate traffic
 curl --interface 127.0.0.1 "http://127.0.1.1:8080/evil.exe"
@@ -172,7 +239,7 @@ curl --interface 127.0.0.1 "http://127.0.1.1:8080/evil.exe"
 ```bash
 # Start your SMB server bound to 127.0.1.1 (port 445)
 # Capture loopback
-./live-capture.sh lo0 30
+./soc-lab capture live lo0 30
 
 # Connect from the "internal" side
 smbclient //127.0.1.1/share -U user --interface 127.0.0.1
@@ -214,7 +281,7 @@ docker exec suricata grep -c '"event_type":"alert"' /var/log/suricata/eve.json
 **Suricata rules:** Add `.rules` files to `./rules/suricata/` — loaded automatically by Suricata. To reload without restarting:
 
 ```bash
-./reload-rules.sh
+./soc-lab rules reload
 ```
 
 **Sigma rules:** Add `.yml` files to `./rules/sigma/` — converted to ElastAlert2 format on every container start. Restart the `elastalert2` container after adding new rules:
@@ -230,11 +297,11 @@ Suricata rule syntax reference: https://docs.suricata.io/en/latest/rules/index.h
 Use this when ingesting non-Suricata logs into Elasticsearch:
 
 ```bash
-./upload-logs.sh logs/test/syslog.log --build-pipeline
-./upload-logs.sh logs/test/cisco-asa.log --type cisco
-./upload-logs.sh logs/test/custom.log --type pipelines/custom/my-parser.yml
-./upload-logs.sh logs/test/apache-access.log --type apache-access --now
-./upload-logs.sh --batch --folder logs/test/custom-stress --build-pipeline
+./soc-lab capture upload logs/<log-file> --build-pipeline
+./soc-lab capture upload logs/<log-file> --type <pipeline>
+./soc-lab capture upload logs/<log-file> --type pipelines/custom/<parser>.yml
+./soc-lab capture upload logs/<log-file> --type <pipeline> --now
+./soc-lab capture upload --batch --folder logs/<folder> --build-pipeline
 ```
 
 Behavior:
@@ -249,7 +316,7 @@ Behavior:
 Notes:
 
 - No automatic pipeline matching is performed
-- The local generator lives in `scripts/pipeline_generator.py`
+- The local generator lives in `scripts/tools/pipeline_generator.py`
 
 Flags:
 
@@ -269,8 +336,8 @@ Batch note:
 ## Stop / Reset
 
 ```bash
-./docker.sh stop    # stop, keep volumes (ES data + rules)
-./docker.sh reset   # stop and wipe everything (rules re-download on next start)
+./soc-lab stack stop    # stop, keep volumes (ES data + rules)
+./soc-lab stack reset   # stop and wipe everything (rules re-download on next start)
 ```
 
 ## Known Constraints

@@ -1,0 +1,94 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$ROOT_DIR/scripts/lib/log.sh"
+
+run_command() {
+  if [[ "${SOC_LAB_SHELL:-0}" == "1" ]]; then
+    SOC_LAB_NO_BANNER=1 "$@"
+    return $?
+  fi
+  printf "\n"
+  "$@"
+  local rc=$?
+  printf "\n"
+  return $rc
+}
+
+usage() {
+  banner "SOC Lab CLI"
+  printf "\n"
+  printf "  %-10s %s\n" "Usage" "soc-lab <group> <command> [args]"
+  printf "\n"
+  printf "  %-10s %-40s\n" "Group" "Commands"
+  printf "  %-10s %-40s\n" "-----" "--------"
+  printf "  %-10s %-40s\n" "stack" "install | start | stop | reset | uninstall | status"
+  printf "  %-10s %-40s\n" "capture" "replay | live | upload"
+  printf "  %-10s %-40s\n" "rules" "reload"
+  printf "  %-10s %-40s\n" "so" "sync | pipelines | templates"
+  printf "  %-10s %-40s\n" "health" "check"
+  printf "  %-10s %-40s\n" "tui" "interactive command shell"
+  printf "  %-10s %-40s\n" "tui-bt" "Bubble Tea TUI preview"
+  printf "\n"
+  printf "  %-10s %s\n" "Examples" ""
+  printf "    soc-lab stack install\n"
+  printf "    soc-lab stack start\n"
+  printf "    soc-lab capture replay pcap/<capture-file>.pcap --now\n"
+  printf "    soc-lab capture live en0 10\n"
+  printf "    soc-lab capture upload logs/<log-file> --type <pipeline>\n"
+  printf "    soc-lab rules reload\n"
+  printf "    soc-lab so sync\n"
+  printf "    soc-lab health check\n"
+  printf "\n"
+  printf "  %-10s %s\n" "Note" "Run without arguments to open interactive TUI"
+}
+
+if [[ "${1:-}" == "--cli" ]]; then
+  shift
+fi
+
+group="${1:-}"
+cmd="${2:-}"
+
+case "$group" in
+  stack)
+    shift
+    run_command "$ROOT_DIR/scripts/commands/stack.sh" "$@"
+    ;;
+  capture)
+    shift
+    run_command "$ROOT_DIR/scripts/commands/capture.sh" "$@"
+    ;;
+  rules)
+    shift
+    run_command "$ROOT_DIR/scripts/commands/rules.sh" "$@"
+    ;;
+  so)
+    shift
+    run_command "$ROOT_DIR/scripts/commands/so.sh" "$@"
+    ;;
+  health)
+    if [[ "$cmd" == "check" ]]; then shift 2; else shift; fi
+    run_command "$ROOT_DIR/scripts/commands/health.sh" "$@"
+    ;;
+  tui)
+    shift
+    run_command "$ROOT_DIR/scripts/commands/tui.sh" "$@"
+    ;;
+  tui-bt)
+    shift
+    run_command "$ROOT_DIR/scripts/commands/tui-bubbletea.sh" "$@"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  "")
+    run_command "$ROOT_DIR/scripts/commands/tui.sh"
+    ;;
+  *)
+    err "Unknown group: $group"
+    usage
+    exit 1
+    ;;
+esac

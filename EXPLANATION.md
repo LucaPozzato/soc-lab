@@ -2,6 +2,22 @@
 
 ---
 
+## How to run it (modes)
+
+SOC Lab supports two user-facing modes:
+
+1. Interactive shell mode (`./soc-lab`)
+   - Opens an interactive prompt (`soc-lab>`)
+   - You type subcommands like `stack start` or `capture replay <pcap>`
+   - Bubble Tea mode (`./soc-lab tui-bt`) is a richer terminal UI with live output streaming and scoped autocomplete
+2. One-shot command mode (`./soc-lab <group> <command> ...`)
+   - Runs one command and exits
+   - Best for scripts/automation
+
+In Bubble Tea mode, `stack install` and `stack uninstall` run outside shell-style output suppression to keep install/uninstall behavior consistent with direct CLI usage.
+
+---
+
 ## The stack: what each piece actually is
 
 Before diving into the config files, it helps to understand what each component does at a fundamental level and how they talk to each other.
@@ -24,7 +40,7 @@ Kibana is a web UI that sits in front of Elasticsearch. It has no database of it
 
 When you open Kibana's Discover view and set a time range, Kibana translates your filters and time range into an ES query, sends it as a `POST /_search` HTTP request to ES on port 9200, and renders the results. When you create a visualization or dashboard, Kibana stores the configuration (as a "saved object") inside ES itself — in a special `.kibana` index. So Kibana persists nothing locally; it's purely a query-and-render layer.
 
-A **data view** (what `docker.sh start` creates via the Kibana API) tells Kibana "there is an index pattern called `suricata-*`, and `@timestamp` is the time field." Without this, Kibana doesn't know the index exists and won't show it in Discover. The `docker.sh start` script creates it automatically by POSTing to Kibana's own REST API (`/api/data_views/data_view`), which in turn saves it as a document in ES's `.kibana` index. It creates three data views: `suricata-*` (raw events), `elastalert2_alerts` (fired alerts), and `soc-alerts` (unified alerts alias).
+A **data view** (what `./soc-lab stack start` creates via the Kibana API) tells Kibana "there is an index pattern called `suricata-*`, and `@timestamp` is the time field." Without this, Kibana doesn't know the index exists and won't show it in Discover. `./soc-lab stack start` creates these automatically by POSTing to Kibana's REST API (`/api/data_views/data_view`), which in turn saves them as documents in ES's `.kibana` index. It creates three data views: `suricata-*` (raw events), `elastalert2_alerts` (fired alerts), and `soc-alerts` (unified alerts alias).
 
 Kibana communicates with ES at `http://elasticsearch:9200` — the Docker internal hostname. Your browser communicates with Kibana at `http://localhost:5601`. Kibana is the middleman; your browser never talks to ES directly.
 
@@ -42,9 +58,37 @@ Filebeat is a lightweight log shipper. It tails files on disk and POSTs new line
 
 Filebeat keeps a **registry** (stored in the `filebeat_data` volume at `/usr/share/filebeat/data/registry/`) that records, for each file it watches, the inode number and the byte offset it last read up to. On restart, it resumes from that offset rather than re-reading from the beginning or missing lines. This is how it survives container restarts without duplicating or losing events.
 
-When `replay-pcap.sh` deletes `eve.json` and Suricata creates a new one, the new file gets a new inode. Filebeat detects the inode change and treats it as a new file, starting from byte 0 — which is exactly the behavior you want for clean replays.
+When `./soc-lab capture replay ...` resets `eve.json` and Suricata creates a new one, the new file gets a new inode. Filebeat detects the inode change and treats it as a new file, starting from byte 0 — which is exactly the behavior you want for clean replays.
 
 Filebeat connects to Elasticsearch using the same HTTP API as everything else. Each batch of events becomes a `POST /_bulk` request — ES's bulk ingest endpoint, which accepts multiple documents in a single HTTP call for efficiency.
+
+### Suricata + Security Onion ingest path
+
+Think of this as a mailroom pipeline:
+
+- Suricata is the scanner generating envelopes (`eve.json` lines)
+- Filebeat is the courier carrying envelopes to Elasticsearch
+- `suricata.common` is the sorting desk that decides which specialist parser handles each envelope
+- The final parsed document is filed into `suricata-*`
+
+```text
+Network packet / PCAP
+  -> Suricata event (JSON line in eve.json)
+  -> Filebeat ships line to Elasticsearch
+  -> Ingest pipeline suricata.common runs
+  -> SO sub-pipeline parses by event type/protocol
+  -> ECS-shaped document indexed in suricata-YYYY.MM.DD
+```
+
+Then detection and UX layers consume that indexed data:
+
+```text
+suricata-* index
+  -> Kibana (search/hunting)
+  -> ElastAlert2 rules (detections)
+       -> elastalert2_alerts index
+            -> soc-alerts alias (unified alert view)
+```
 
 ### ElastAlert2
 
@@ -63,7 +107,7 @@ ElastAlert2 maintains its own set of writeback indices in ES:
 
 **Timestamp correction:** ElastAlert2 writes the alert document with `@timestamp` set to the current time (when the alert ran), not the time of the matched event. A background loop in `elastalert-start.sh` patches this every 2 seconds by copying `match_body.@timestamp` → `@timestamp`, so Kibana's timeline shows when the event happened rather than when ElastAlert2 processed it. The loop skips documents where `@timestamp` already equals `match_body.@timestamp` (`ctx.op = "noop"`) to avoid unnecessary ES writes. There is a ~2-second window after an alert fires where the timestamp is still the processing time.
 
-**Scan window:** ElastAlert2 uses the `endtime` in `elastalert2_alerts_status` to track where it last searched up to for each rule. On each run it only scans from that point forward. This means if you do a PCAP replay with old timestamps, just clearing the status documents isn't enough — the running process keeps its scan window in memory. `replay-pcap.sh` handles this by stopping and restarting the container, which forces ElastAlert2 to re-read the status from ES and scan the full 180-day `buffer_time` window on startup. The 180-day window means PCAP replays with event timestamps up to 6 months old will still be detected.
+**Scan window:** ElastAlert2 uses the `endtime` in `elastalert2_alerts_status` to track where it last searched up to for each rule. On each run it only scans from that point forward. This means if you do a PCAP replay with old timestamps, just clearing the status documents isn't enough — the running process keeps its scan window in memory. `./soc-lab capture replay ...` handles this by stopping and restarting the container, which forces ElastAlert2 to re-read the status from ES and scan the full 180-day `buffer_time` window on startup. The 180-day window means PCAP replays with event timestamps up to 6 months old will still be detected.
 
 ---
 
@@ -93,9 +137,9 @@ Port 5601 is forwarded to your host so you can hit `http://localhost:5601`.
 
 ```yaml
 entrypoint: ["/suricata-start.sh"]              # overrides the image's default entrypoint
-./scripts/suricata-start.sh:/suricata-start.sh  # mounts your script into the container
+./scripts/runtime/suricata-start.sh:/suricata-start.sh  # mounts your script into the container
 ./config/suricata/suricata.yaml:/etc/suricata/suricata.yaml   # your config replaces the default
-./logs/suricata:/var/log/suricata               # eve.json lands on your host filesystem
+./docker-logs/suricata:/var/log/suricata        # eve.json lands on your host filesystem
 ./pcap:/pcap:ro                                 # your pcap folder is readable inside container
 ./rules/suricata:/etc/suricata/rules/custom     # custom .rules files auto-loaded
 suricata_rules:/var/lib/suricata/rules          # named volume — rules survive restarts
@@ -105,7 +149,7 @@ suricata_rules:/var/lib/suricata/rules          # named volume — rules survive
 
 ```yaml
 user: root                                 # needed to read files written by Suricata
-./logs/suricata:/var/log/suricata:ro       # reads the same eve.json Suricata writes
+./docker-logs/suricata:/var/log/suricata:ro # reads the same eve.json Suricata writes
 filebeat_data:/usr/share/filebeat/data     # persists read position — survives restarts
 command: filebeat -e --strict.perms=false  # -e logs to stderr; --strict.perms=false skips config ownership check
 ```
@@ -114,7 +158,7 @@ command: filebeat -e --strict.perms=false  # -e logs to stderr; --strict.perms=f
 
 ```yaml
 user: root                                                    # needed for pip install inside container
-./scripts/elastalert-start.sh:/elastalert-start.sh           # entrypoint: converts sigma rules, starts elastalert2
+./scripts/runtime/elastalert-start.sh:/elastalert-start.sh   # entrypoint: converts sigma rules, starts elastalert2
 ./config/elastalert2/elastalert2.yml:/opt/elastalert2/config.yaml  # run interval, buffer window
 ./config/elastalert2/rules:/opt/elastalert2/rules-static:ro  # hand-written rules mounted read-only
 ./rules/sigma:/opt/sigma/rules:ro                            # sigma rules mounted read-only; converted on start
@@ -261,9 +305,9 @@ This means a single query to `soc-alerts` returns both Suricata IDS alerts and h
 
 ---
 
-## `upload-logs.sh` — Generic log ingest workflow
+## `scripts/tools/upload-logs.sh` — Generic log ingest workflow
 
-`upload-logs.sh` is intentionally separate from the Suricata replay path. It is a generic parser/uploader for arbitrary log files.
+`scripts/tools/upload-logs.sh` is intentionally separate from the Suricata replay path. It is a generic parser/uploader for arbitrary log files.
 
 ### Decision flow
 
@@ -296,7 +340,7 @@ This means a single query to `soc-alerts` returns both Suricata IDS alerts and h
 
 3. **Pipeline load and validation**
    - For `--type`, loads named/local YAML pipeline into Elasticsearch if needed
-   - For `--build-pipeline`, generates pipeline using `scripts/pipeline_generator.py`
+   - For `--build-pipeline`, generates pipeline using `scripts/tools/pipeline_generator.py`
    - Validates generated parser via `_simulate` before indexing
 
 4. **Timestamp behavior**
@@ -312,7 +356,7 @@ This means a single query to `soc-alerts` returns both Suricata IDS alerts and h
 
 ### Who actually ships logs in this path?
 
-For `upload-logs.sh`, **the script itself ships documents directly to Elasticsearch**. Filebeat is not in this path.
+For `scripts/tools/upload-logs.sh`, **the script itself ships documents directly to Elasticsearch**. Filebeat is not in this path.
 
 - The script builds NDJSON bulk payloads (`{"create":...}` action line + document line).
 - It sends them to `POST /_bulk` using `curl`.
@@ -321,9 +365,9 @@ For `upload-logs.sh`, **the script itself ships documents directly to Elasticsea
 
 So the upload path is:
 
-1. local file -> read/normalize by `upload-logs.sh`
+1. local file -> read/normalize by `scripts/tools/upload-logs.sh`
 2. optional pipeline selection/generation
-3. `upload-logs.sh` sends `_bulk` requests directly to ES
+3. `scripts/tools/upload-logs.sh` sends `_bulk` requests directly to ES
 4. ES ingest node runs pipeline processors and indexes docs
 5. Kibana reads indexed docs from ES
 
@@ -583,14 +627,14 @@ Restarts both. Filebeat detects the new `eve.json` inode and ships from byte 0. 
 ### PCAP replay
 
 ```
-./replay-pcap.sh capture.pcap
+./soc-lab capture replay pcap/<capture-file>.pcap
   │
   ├─ curl DELETE /suricata-*              →  Elasticsearch wipes old Suricata indices
   ├─ _delete_by_query elastalert2_alerts* →  ElastAlert2 writeback cleared
   ├─ docker stop filebeat elastalert2     →  both shippers stopped
   ├─ docker exec suricata rm eve.json     →  log file deleted
   │
-  ├─ docker exec suricata suricata -r /pcap/capture.pcap
+  ├─ docker exec suricata suricata -r /pcap/<capture-file>.pcap
   │     │
   │     │  Suricata reads each packet from the PCAP:
   │     │    1. Reassembles TCP streams

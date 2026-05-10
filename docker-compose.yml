@@ -39,7 +39,7 @@ services:
     container_name: suricata
     entrypoint: ["/suricata-start.sh"]
     volumes:
-      - ./scripts/suricata-start.sh:/suricata-start.sh:ro
+      - ./scripts/runtime/suricata-start.sh:/suricata-start.sh:ro
       - ./config/suricata/suricata.yaml:/etc/suricata/suricata.yaml
       - ./config/suricata/threshold.config:/etc/suricata/threshold.config
       - ./docker-logs/suricata:/var/log/suricata
@@ -68,7 +68,7 @@ services:
     container_name: elastalert2
     user: root
     volumes:
-      - ./scripts/elastalert-start.sh:/elastalert-start.sh:ro
+      - ./scripts/runtime/elastalert-start.sh:/elastalert-start.sh:ro
       - ./config/elastalert2/elastalert2.yml:/opt/elastalert2/config.yaml:ro
       - ./config/elastalert2/rules:/opt/elastalert2/rules-static:ro
       - ./rules/sigma:/opt/sigma/rules:ro
