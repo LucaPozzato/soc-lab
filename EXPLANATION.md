@@ -24,7 +24,7 @@ Kibana is a web UI that sits in front of Elasticsearch. It has no database of it
 
 When you open Kibana's Discover view and set a time range, Kibana translates your filters and time range into an ES query, sends it as a `POST /_search` HTTP request to ES on port 9200, and renders the results. When you create a visualization or dashboard, Kibana stores the configuration (as a "saved object") inside ES itself — in a special `.kibana` index. So Kibana persists nothing locally; it's purely a query-and-render layer.
 
-A **data view** (what `docker.sh start` creates via the Kibana API) tells Kibana "there is an index pattern called `suricata-*`, and `@timestamp` is the time field." Without this, Kibana doesn't know the index exists and won't show it in Discover. The `docker.sh start` script creates it automatically by POSTing to Kibana's own REST API (`/api/data_views/data_view`), which in turn saves it as a document in ES's `.kibana` index. It creates two data views: one for `suricata-*` (raw events) and one for `elastalert2_alerts` (fired alerts).
+A **data view** (what `docker.sh start` creates via the Kibana API) tells Kibana "there is an index pattern called `suricata-*`, and `@timestamp` is the time field." Without this, Kibana doesn't know the index exists and won't show it in Discover. The `docker.sh start` script creates it automatically by POSTing to Kibana's own REST API (`/api/data_views/data_view`), which in turn saves it as a document in ES's `.kibana` index. It creates three data views: `suricata-*` (raw events), `elastalert2_alerts` (fired alerts), and `soc-alerts` (unified alerts alias).
 
 Kibana communicates with ES at `http://elasticsearch:9200` — the Docker internal hostname. Your browser communicates with Kibana at `http://localhost:5601`. Kibana is the middleman; your browser never talks to ES directly.
 
@@ -247,10 +247,10 @@ alert_time_limit:
 
 | Source               | Filter applied                                                                |
 | -------------------- | ----------------------------------------------------------------------------- |
-| `suricata-*`         | `event_type:alert` — Suricata IDS rule hits only (not DNS/HTTP/flow metadata) |
+| `suricata-*`         | Alias filter matches `event.dataset: alert` or `event.dataset: suricata.alert`, plus `tags: alert` fallback |
 | `elastalert2_alerts` | none — all ElastAlert2/Sigma fired alerts                                     |
 
-This means a single query to `soc-alerts` returns both raw IDS alerts from Suricata and higher-level sigma detections from ElastAlert2, without needing to query two separate indices.
+This means a single query to `soc-alerts` returns both Suricata IDS alerts and higher-level Sigma/ElastAlert2 detections without querying two separate indices.
 
 **How it's kept alive across resets:**
 
@@ -445,49 +445,55 @@ These 8 SIDs are Emerging Threats rules that fire on bad TCP checksums (`ET SCAN
 
 ## `config/filebeat/filebeat.yml` — Log shipping
 
-**Input (lines 1–12)**
+Filebeat tails Suricata `eve.json` and sends each line to Elasticsearch through ingest pipeline `suricata.common`.
+
+**Input (lines 1–13)**
 
 ```yaml
 - type: log
   paths:
-    - /var/log/suricata/eve.json # the same file Suricata writes
-  json.keys_under_root: true # parse JSON and put fields at top level (not nested under "json")
-  json.add_error_key: true # if JSON parse fails, add a field "error.message" instead of silently dropping
+    - /var/log/suricata/eve.json
   fields:
     source_type: suricata
-  fields_under_root: true # put source_type at top level, not nested under "fields"
+    module: suricata
+  fields_under_root: true
   tags: ["suricata"]
 ```
 
-Filebeat tails `eve.json` line by line. Each line is a JSON event. `json.keys_under_root` means `alert.signature` becomes a top-level field in ES, not `json.alert.signature`.
+`module: suricata` is required by the SO ingest chain because `suricata.common` builds `event.dataset` from module + event type.
 
-**Processors (lines 14–25)**
+**Processors (lines 14–17)**
 
-The `timestamp` processor:
+`drop_fields` removes Filebeat bookkeeping fields (`agent.hostname`, `host`, `input`, `log`, `ecs`) so indexed docs stay focused on Suricata event content.
 
-```yaml
-field: timestamp # Suricata's eve.json uses "timestamp" for the event time
-target_field: "@timestamp" # ES/Kibana expects "@timestamp" for time-based queries
-layouts: # Go-style time format strings — two variants for ±timezone offset
-  - "2006-01-02T15:04:05.999999-0700"
-  - "2006-01-02T15:04:05.999999+0000"
-```
-
-Without this, `@timestamp` would be the time Filebeat read the line (now), not the time the packet was seen — making time-based queries in Kibana meaningless for replays.
-
-The `drop_fields` processor removes Filebeat's own metadata (`agent.hostname`, `host`, `input`, `log`, `message`) — these are Filebeat bookkeeping fields, not Suricata data, and they'd just clutter your ES documents.
-
-**Output (lines 28–30)**
+**Output (lines 19–23)**
 
 ```yaml
-hosts: ["elasticsearch:9200"] # Docker internal DNS
-index: "suricata-%{+yyyy.MM.dd}" # creates daily indices: suricata-2026.04.19
+hosts: ["elasticsearch:9200"]
+index: "suricata-%{+yyyy.MM.dd}"
+pipeline: "suricata.common"
 ```
 
-Daily indices let you delete old data by date and keep queries fast.
+Protocol parsing happens server-side in ES ingest (SO pipelines), not in Filebeat.
 
-**`setup.ilm.enabled: false` and `setup.template.enabled: false` (lines 32–33)**
-By default Filebeat tries to set up Index Lifecycle Management policies and index templates in ES. Both are disabled here — you're managing the index manually (`docker.sh start` creates the data view via the Kibana API). This avoids permission errors and keeps the setup simple.
+**`setup.ilm.enabled: false` and `setup.template.enabled: false`**
+
+Automatic ILM/template setup is disabled so this lab can explicitly control mappings/templates through `load-so-templates.sh` and startup index templates.
+
+---
+
+## SO ingest loaders (`load-so-pipelines.sh`, `load-so-templates.sh`)
+
+Startup loads Security Onion ingest artifacts directly from the SO 2.4 repository, then applies small compatibility patches.
+
+- `load-so-templates.sh` loads curated ECS component templates and creates index template `suricata-so-ecs` for `suricata-*`
+- `suricata-so-ecs` sets `index.mapping.ignore_malformed: true` and `index.mapping.total_fields.limit: 5000` to prevent field-limit drops on rich Suricata events
+- `load-so-pipelines.sh` loads `suricata.*`, `common.nids`, `dns.tld`, `http.status`, and dynamic `common`
+- Dynamic `common` is pulled from SO `ingest-dynamic/common` and Jinja wrapper lines are stripped before PUT
+- `suricata.common` is patched to tolerate missing protocol pipelines (`ignore_missing_pipeline`, `ignore_failure`) so unsupported event families do not drop whole docs
+- `suricata.alert` is patched to run protocol enrichment pipeline `suricata.{{message2.app_proto}}` when available and to enforce `event.dataset: suricata.alert`
+
+This preserves SO-native parsing while keeping replay coverage stable when protocol-specific pipelines are missing.
 
 ---
 
@@ -602,14 +608,14 @@ Restarts both. Filebeat detects the new `eve.json` inode and ships from byte 0. 
   │     │  Filebeat starts up:
   │     │    1. Reads registry — sees eve.json has a new inode, starts from byte 0
   │     │    2. Reads each line of eve.json (one JSON object per line)
-  │     │    3. Parses the JSON, promotes fields to root level
-  │     │    4. timestamp processor: copies "timestamp" → "@timestamp"
-  │     │    5. drop_fields: strips agent/host/input/log/message noise
-  │     │    6. Batches events into bulk HTTP requests
-  │     │    7. POST /_bulk → elasticsearch:9200
+  │     │    3. Adds fields/tags (including module=suricata)
+  │     │    4. drop_fields: strips Filebeat bookkeeping noise
+  │     │    5. Batches events into bulk HTTP requests
+  │     │    6. POST /_bulk?pipeline=suricata.common → elasticsearch:9200
   │     │         body: { "index": { "_index": "suricata-2026.04.19" } }
   │     │                { ...event document... }
   │     │                ...
+  │     │    7. ES ingest pipeline chain parses event_type/app_proto and normalizes ECS fields
   │     │    8. Updates registry with new byte offset after each successful batch
   │     │
   │     └─ continues tailing (waiting for new lines) until stopped

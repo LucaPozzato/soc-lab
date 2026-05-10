@@ -71,11 +71,13 @@ if [ "$KEEP" = "false" ]; then
     curl -s -X POST "http://localhost:9200/${idx}/_delete_by_query" \
         -H 'Content-Type: application/json' -d "$DQ" >/dev/null 2>&1 || true
   done
-  docker stop filebeat elastalert2 >/dev/null
-  docker exec suricata sh -c 'rm -f /var/log/suricata/eve.json /var/log/suricata/suricata.log'
+  # Restart ElastAlert2 only for clean replays so its in-memory scan window
+  # resets and it rescans from scratch.
+  docker stop elastalert2 >/dev/null
+  docker exec suricata sh -c ': > /var/log/suricata/eve.json; : > /var/log/suricata/suricata.log'
 else
   echo "[*] Keeping existing data (--keep)..."
-  docker stop filebeat elastalert2 >/dev/null
+  # Keep ElastAlert2 running so existing alerts in elastalert2_alerts remain.
 fi
 
 echo "[*] Sending pcap to Suricata..."
@@ -143,16 +145,46 @@ with open(eve, "w") as f:
 EOF
 fi
 
-echo "[+] Suricata done. Starting filebeat and elastalert2..."
+if [ "$KEEP" = "false" ]; then
+  echo "[+] Suricata done. Starting elastalert2..."
+else
+  echo "[+] Suricata done. ElastAlert2 kept running (--keep)."
+fi
 
 # Ensure template + alias survive volume wipes and are in place before Filebeat
 # creates the new suricata-* index (template applies at index-creation time).
 curl -s -X PUT "http://localhost:9200/_index_template/suricata-soc-alerts" \
   -H 'Content-Type: application/json' \
-  -d '{"index_patterns":["suricata-*"],"template":{"aliases":{"soc-alerts":{"filter":{"term":{"event_type":"alert"}}}}}}' \
+  -d '{"index_patterns":["suricata-*"],"template":{"aliases":{"soc-alerts":{"filter":{"bool":{"should":[{"term":{"event.dataset":"alert"}},{"term":{"event.dataset":"suricata.alert"}},{"term":{"tags":"alert"}}],"minimum_should_match":1}}}}}}}' \
   >/dev/null 2>&1
 
-docker start filebeat elastalert2 >/dev/null
+curl -s -X POST "http://localhost:9200/_aliases" \
+  -H 'Content-Type: application/json' \
+  -d '{"actions":[{"remove":{"index":"suricata-*","alias":"soc-alerts"}}]}' >/dev/null 2>&1 || true
+curl -s -X POST "http://localhost:9200/_aliases" \
+  -H 'Content-Type: application/json' \
+  -d '{"actions":[{"add":{"index":"suricata-*","alias":"soc-alerts","filter":{"bool":{"should":[{"term":{"event.dataset":"alert"}},{"term":{"event.dataset":"suricata.alert"}},{"term":{"tags":"alert"}}],"minimum_should_match":1}}}}]}' >/dev/null 2>&1 || true
+curl -s -X POST "http://localhost:9200/_aliases" \
+  -H 'Content-Type: application/json' \
+  -d '{"actions":[{"add":{"index":"elastalert2_alerts","alias":"soc-alerts"}}]}' >/dev/null 2>&1 || true
+
+if [ "$KEEP" = "false" ]; then
+  docker start elastalert2 >/dev/null
+fi
+
+# Re-attach Suricata side of soc-alerts after suricata-* index exists.
+for i in $(seq 1 30); do
+  if curl -s "http://localhost:9200/_cat/indices/suricata-*?h=index" | grep -q '^suricata-'; then
+    curl -s -X POST "http://localhost:9200/_aliases" \
+      -H 'Content-Type: application/json' \
+      -d '{"actions":[{"remove":{"index":"suricata-*","alias":"soc-alerts"}}]}' >/dev/null 2>&1 || true
+    curl -s -X POST "http://localhost:9200/_aliases" \
+      -H 'Content-Type: application/json' \
+      -d '{"actions":[{"add":{"index":"suricata-*","alias":"soc-alerts","filter":{"bool":{"should":[{"term":{"event.dataset":"alert"}},{"term":{"event.dataset":"suricata.alert"}},{"term":{"tags":"alert"}}],"minimum_should_match":1}}}}]}' >/dev/null 2>&1 || true
+    break
+  fi
+  sleep 1
+done
 
 echo ""
 echo "======================================"

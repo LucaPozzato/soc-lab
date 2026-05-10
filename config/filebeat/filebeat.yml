@@ -4,31 +4,22 @@ filebeat.inputs:
     enabled: true
     paths:
       - /var/log/suricata/eve.json
-    json.keys_under_root: true
-    json.add_error_key: true
     fields:
       source_type: suricata
+      module: suricata
     fields_under_root: true
     tags: ["suricata"]
     scan_frequency: 1s
 
 processors:
-  - timestamp:
-      when:
-        has_fields: ["timestamp"]
-      field: timestamp
-      layouts:
-        - "2006-01-02T15:04:05.999999-0700"
-        - "2006-01-02T15:04:05.999999+0000"
-      target_field: "@timestamp"
-
   - drop_fields:
-      fields: ["agent.hostname", "ecs", "host", "input", "log", "message"]
+      fields: ["agent.hostname", "ecs", "host", "input", "log"]
       ignore_missing: true
 
 output.elasticsearch:
   hosts: ["elasticsearch:9200"]
   index: "suricata-%{+yyyy.MM.dd}"
+  pipeline: "suricata.common"
 
 setup.ilm.enabled: false
 setup.template.enabled: false

@@ -55,6 +55,20 @@ cmd_start() {
         [ $i -eq 40 ] && { echo ""; die "Elasticsearch did not become healthy in time."; }
     done
 
+    echo -n "    SO templates    "
+    if bash "$(cd "$(dirname "$0")" && pwd)/load-so-templates.sh" >/dev/null 2>&1; then
+        echo -e " ${GREEN}loaded${NC}"
+    else
+        echo -e " ${YELLOW}failed (check load-so-templates.sh)${NC}"
+    fi
+
+    echo -n "    SO pipelines    "
+    if bash "$(cd "$(dirname "$0")" && pwd)/load-so-pipelines.sh" >/dev/null 2>&1; then
+        echo -e " ${GREEN}loaded${NC}"
+    else
+        echo -e " ${YELLOW}failed (check load-so-pipelines.sh)${NC}"
+    fi
+
     echo -n "    Ingest pipelines"
     pipe_count=0
     for pf in pipelines/known/*.json pipelines/generated/*.json; do
@@ -78,14 +92,19 @@ cmd_start() {
     # ES index template (auto-applies soc-alerts alias to new suricata-* indices)
     curl -s -X PUT "http://localhost:9200/_index_template/suricata-soc-alerts" \
       -H 'Content-Type: application/json' \
-      -d '{"index_patterns":["suricata-*"],"template":{"aliases":{"soc-alerts":{"filter":{"term":{"event_type":"alert"}}}}}}' \
+      -d '{"index_patterns":["suricata-*"],"template":{"aliases":{"soc-alerts":{"filter":{"bool":{"should":[{"term":{"event.dataset":"alert"}},{"term":{"event.dataset":"suricata.alert"}},{"term":{"tags":"alert"}}],"minimum_should_match":1}}}}}}}' \
       >/dev/null 2>&1
     curl -s -X POST "http://localhost:9200/_aliases" \
       -H 'Content-Type: application/json' \
       -d '{"actions":[
-        {"add":{"index":"suricata-*","alias":"soc-alerts","filter":{"term":{"event_type":"alert"}},"ignore_unavailable":true}},
-        {"add":{"index":"elastalert2_alerts","alias":"soc-alerts","ignore_unavailable":true}}
+        {"remove":{"index":"suricata-*","alias":"soc-alerts"}},
+        {"add":{"index":"suricata-*","alias":"soc-alerts","filter":{"bool":{"should":[{"term":{"event.dataset":"alert"}},{"term":{"event.dataset":"suricata.alert"}},{"term":{"tags":"alert"}}],"minimum_should_match":1}}}}
       ]}' >/dev/null 2>&1
+    if curl -s "http://localhost:9200/_cat/indices/elastalert2_alerts?h=index" | grep -q '^elastalert2_alerts$'; then
+      curl -s -X POST "http://localhost:9200/_aliases" \
+        -H 'Content-Type: application/json' \
+        -d '{"actions":[{"add":{"index":"elastalert2_alerts","alias":"soc-alerts"}}]}' >/dev/null 2>&1
+    fi
 
     echo -n "    Kibana data views"
     for i in $(seq 1 24); do

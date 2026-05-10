@@ -20,6 +20,18 @@ Personal security lab for testing Suricata IDS detection and whitelist rules via
 
 On first run, Suricata downloads ~43k Emerging Threats community rules (~1-2 minutes). Rules persist across restarts.
 
+## Security Onion ingest compatibility
+
+Suricata events are parsed with Security Onion (SO) ingest pipelines and ECS component templates, loaded at startup.
+
+- `docker.sh start` runs `load-so-templates.sh` and `load-so-pipelines.sh` after Elasticsearch is healthy
+- Filebeat writes to `suricata-%{+yyyy.MM.dd}` with ingest pipeline `suricata.common`
+- `suricata.common` dispatches by event type; `suricata.alert` is patched to also dispatch by `app_proto` when available
+- Alert docs are forced to `event.dataset: suricata.alert` and stay in `suricata-*` (no alert index override)
+- `suricata-so-ecs` template composes SO ECS components and sets `index.mapping.total_fields.limit: 5000`
+
+This keeps broad event coverage (dns/http/tls/flow/quic/alert/etc.) while preserving SO-native parsing behavior.
+
 ## Directory Layout
 
 ```
@@ -45,7 +57,7 @@ rules/
 
 | Script | What it does |
 |---|---|
-| `docker.sh start` | Start stack, wait for healthy, create ES data views |
+| `docker.sh start` | Start stack, wait for healthy, load SO templates/pipelines, create ES data views |
 | `docker.sh stop` | Stop containers, keep volumes (ES data + rules) |
 | `docker.sh reset` | Stop containers and wipe all volumes |
 | `check-health.sh` | Container status, ES cluster health, recent log samples, ElastAlert2 alert count |
@@ -63,6 +75,8 @@ cp /path/to/capture.pcap ./pcap/
 ```
 
 Each replay wipes previous Suricata events and all ElastAlert2 state (alerts, status, silence), then restarts ElastAlert2 so it rescans from scratch. Suricata events appear in Kibana under `suricata-*`; ElastAlert2 alerts under `elastalert2_alerts`. Both are combined in the `soc-alerts` unified alias (Kibana data view "Alerts"), which shows Suricata IDS alerts and ElastAlert2/Sigma fired alerts together in one place.
+
+Replay also re-applies the `suricata-soc-alerts` template and re-attaches the `soc-alerts` alias after the new `suricata-*` index is created, so Suricata alert membership is stable after resets.
 
 The optional `-now` flag shifts all event timestamps to the current time while preserving relative timing:
 
@@ -180,6 +194,16 @@ curl -s "http://localhost:9200/elastalert2_alerts/_count"
 
 # All alerts unified (Suricata IDS + ElastAlert2/Sigma)
 curl -s "http://localhost:9200/soc-alerts/_count"
+
+# Dataset distribution in suricata-* (quick parse sanity)
+curl -s "http://localhost:9200/suricata-*/_search?pretty" \
+  -H 'Content-Type: application/json' \
+  -d '{"size":0,"aggs":{"by_dataset":{"terms":{"field":"event.dataset.keyword","size":20}}}}'
+
+# Alert protocol enrichment check (examples)
+curl -s "http://localhost:9200/suricata-*/_search?pretty" \
+  -H 'Content-Type: application/json' \
+  -d '{"size":5,"query":{"term":{"event.dataset.keyword":"suricata.alert"}},"_source":["event.dataset","app_proto","dns.query.name","http.response.status_code","ssl.server_name","alert.signature"]}'
 
 # Quick count from eve.json directly
 docker exec suricata grep -c '"event_type":"alert"' /var/log/suricata/eve.json

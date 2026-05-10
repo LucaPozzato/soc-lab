@@ -45,10 +45,38 @@ cleanup() {
     log "Stopping capture..."
     [ -n "${CAPTURE_PID:-}" ] && kill "$CAPTURE_PID" 2>/dev/null || true
     wait "${CAPTURE_PID:-}" 2>/dev/null || true
+    if [ -n "${CURRENT_PCAP:-}" ] && [ -f "$CURRENT_PCAP" ]; then
+        name=$(basename "$CURRENT_PCAP")
+        if ! grep -qxF "$name" "$REPLAYED" 2>/dev/null; then
+            log "Finalizing last capture chunk: $name"
+            process_pcap "$CURRENT_PCAP" || true
+        fi
+    fi
     log "Stopped. Events from this session remain in Kibana."
     exit 0
 }
 trap cleanup SIGINT SIGTERM
+
+process_pcap() {
+    local pcap="$1"
+    local name
+    name=$(basename "$pcap")
+    [ -f "$pcap" ] || return 0
+    if grep -qxF "$name" "$REPLAYED" 2>/dev/null; then
+        return 0
+    fi
+
+    log "Processing: $name"
+    docker exec suricata suricata \
+        -c /etc/suricata/suricata.yaml \
+        -r "/pcap/live/$name" \
+        --pidfile /var/run/suricata-replay.pid \
+        -l /var/log/suricata \
+        -k none \
+        2>/dev/null
+    echo "$name" >> "$REPLAYED"
+    log "Done: $name -> events shipping to Kibana"
+}
 
 # ---- prereqs ----
 command -v tcpdump >/dev/null 2>&1 || { echo "ERROR: tcpdump not found"; exit 1; }
@@ -63,13 +91,10 @@ if [ "$KEEP" = "false" ]; then
     log "Clearing previous session..."
     curl -s "http://localhost:9200/_cat/indices/suricata-*?h=index" | \
         xargs -I{} curl -s -X DELETE "http://localhost:9200/{}" >/dev/null
-    docker stop filebeat >/dev/null 2>&1 || true
-    docker exec suricata sh -c 'rm -f /var/log/suricata/eve.json /var/log/suricata/suricata.log' 2>/dev/null || true
+    docker exec suricata sh -c ': > /var/log/suricata/eve.json; : > /var/log/suricata/suricata.log' 2>/dev/null || true
 else
     log "Keeping existing data (--keep)..."
-    docker stop filebeat >/dev/null 2>&1 || true
 fi
-docker start filebeat >/dev/null
 
 echo ""
 log "Capturing on $INTERFACE, rotating every ${ROTATION_SECS}s."
@@ -77,13 +102,16 @@ log "Kibana: http://localhost:5601  |  Ctrl+C to stop"
 echo ""
 
 # ---- capture loop (background) ----
-# -G exits after one rotation on WSL — restart immediately to minimise gap.
+# Keep tcpdump running continuously; if it exits (observed on some WSL builds),
+# restart immediately and continue from the next file.
 capture_loop() {
     while true; do
         sudo tcpdump -i "$INTERFACE" \
+            -U \
             -G "$ROTATION_SECS" \
             -w "$PCAP_DIR/capture_%Y%m%d_%H%M%S.pcap" \
             2>/dev/null || true
+        sleep 0.2
     done
 }
 capture_loop &
@@ -91,27 +119,17 @@ CAPTURE_PID=$!
 
 # ---- watch loop ----
 while kill -0 "$CAPTURE_PID" 2>/dev/null; do
-    pcaps=()
-    while IFS= read -r f; do pcaps+=("$f"); done < <(ls -t "$PCAP_DIR"/capture_*.pcap 2>/dev/null || true)
+    current=""
+    current=$(ls -t "$PCAP_DIR"/capture_*.pcap 2>/dev/null | head -n 1 || true)
+    [ -n "$current" ] && CURRENT_PCAP="$current"
 
-    # Skip index 0 — tcpdump is still writing it
-    for ((i=${#pcaps[@]}-1; i>=1; i--)); do
-        pcap="${pcaps[$i]}"
-        name=$(basename "$pcap")
-        if ! grep -qxF "$name" "$REPLAYED" 2>/dev/null; then
-            log "New rotation: $name — running through Suricata..."
-            docker exec suricata suricata \
-                -c /etc/suricata/suricata.yaml \
-                -r "/pcap/live/$name" \
-                --pidfile /var/run/suricata-replay.pid \
-                -l /var/log/suricata \
-                -k none \
-                2>/dev/null
-            echo "$name" >> "$REPLAYED"
-            log "Done: $name → events shipping to Kibana"
-        fi
-    done
-
+    pcaps=("$PCAP_DIR"/capture_*.pcap)
+    if [ -e "${pcaps[0]}" ]; then
+        for pcap in "${pcaps[@]}"; do
+            [ "$pcap" = "$CURRENT_PCAP" ] && continue
+            process_pcap "$pcap"
+        done
+    fi
     sleep 2
 done
 
