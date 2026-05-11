@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -49,6 +51,39 @@ type streamEnvelopeMsg struct {
 	Msg tea.Msg
 }
 type streamClosedMsg struct{}
+
+var runningProc = struct {
+	sync.Mutex
+	cmd *exec.Cmd
+}{}
+
+func setRunningCmd(cmd *exec.Cmd) {
+	runningProc.Lock()
+	runningProc.cmd = cmd
+	runningProc.Unlock()
+}
+
+func clearRunningCmd(cmd *exec.Cmd) {
+	runningProc.Lock()
+	if runningProc.cmd == cmd {
+		runningProc.cmd = nil
+	}
+	runningProc.Unlock()
+}
+
+func stopRunningCmd() bool {
+	runningProc.Lock()
+	cmd := runningProc.cmd
+	runningProc.Unlock()
+	if cmd == nil || cmd.Process == nil {
+		return false
+	}
+	pid := cmd.Process.Pid
+	if pid <= 0 {
+		return false
+	}
+	return syscall.Kill(-pid, syscall.SIGINT) == nil
+}
 
 type model struct {
 	input         textinput.Model
@@ -455,6 +490,7 @@ func runSocLabCmd(repoRoot, cmdline string, assumeYes bool) tea.Cmd {
 		args := append([]string{"--cli"}, parts...)
 		cmd := exec.Command(filepath.Join(repoRoot, "soc-lab"), args...)
 		cmd.Dir = repoRoot
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		env := append([]string{}, os.Environ()...)
 		isStackInstall := len(parts) >= 2 && parts[0] == "stack" && parts[1] == "install"
 		isStackUninstall := len(parts) >= 2 && parts[0] == "stack" && parts[1] == "uninstall"
@@ -479,9 +515,11 @@ func runSocLabCmd(repoRoot, cmdline string, assumeYes bool) tea.Cmd {
 		if err := cmd.Start(); err != nil {
 			return cmdOutMsg{Cmd: cmdline, Output: err.Error(), Err: err}
 		}
+		setRunningCmd(cmd)
 
 		go func() {
 			defer close(streamCh)
+			defer clearRunningCmd(cmd)
 			forward := func(r io.Reader) {
 				s := bufio.NewScanner(r)
 				buf := make([]byte, 0, 64*1024)
@@ -643,8 +681,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.completionIdx = 0
 		}
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "q":
 			return m, tea.Quit
+		case "ctrl+c":
+			if m.running {
+				if stopRunningCmd() {
+					if !strings.HasSuffix(m.output, "\n") {
+						m.output += "\n"
+					}
+					m.output += "(interrupt requested)"
+					m.viewport.SetContent(strings.TrimRight(m.output, "\n"))
+					m.viewport.GotoBottom()
+				}
+				return m, nil
+			}
+			return m, nil
 		case "f":
 			m.focusMode = !m.focusMode
 			return m, nil
