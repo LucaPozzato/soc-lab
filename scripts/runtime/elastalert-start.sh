@@ -8,14 +8,16 @@ echo "[*] Installing sigma plugin..."
 pip install sigma-cli -q 2>/dev/null
 sigma plugin install elasticsearch 2>&1 | grep -v '^WARNING'
 
-# Patch helper: fix index wildcard → suricata-* and add required alert field
+# Patch helper: keep Sigma index broad (all indices) and add required alert field
 cat > /tmp/patch_rule.py << 'EOF'
 import sys, yaml
 path = sys.argv[1]
 with open(path) as fh:
     r = yaml.safe_load(fh)
-if not r.get('index') or r['index'] in ('*', ''):
-    r['index'] = 'suricata-*'
+# If Sigma conversion does not provide a useful index, search all indices.
+# This prevents rules from being pinned to Suricata-only data.
+if not r.get('index') or r['index'] == '':
+    r['index'] = '*'
 if 'alert' not in r:
     r['alert'] = ['debug']
 if 'query_key' not in r:

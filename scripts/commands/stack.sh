@@ -140,6 +140,7 @@ cmd_start() {
   for i in $(seq 1 24); do
     if curl -s http://localhost:5601/api/status 2>/dev/null | grep -q '"level":"available"'; then
       for dv in \
+        '{"title":"*","timeFieldName":"@timestamp","name":"All Logs"}' \
         '{"title":"suricata-*","timeFieldName":"@timestamp","name":"Suricata"}' \
         '{"title":"elastalert2_alerts","timeFieldName":"@timestamp","name":"ElastAlert2 Alerts"}' \
         '{"title":"soc-alerts","timeFieldName":"@timestamp","name":"Alerts"}'; do
