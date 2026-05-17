@@ -216,14 +216,28 @@ PY
 
 ensure_data_view() {
     local pattern="$1" name="$2"
-    curl -sf "http://localhost:5601/api/status" -o /dev/null 2>/dev/null || return 0
+    local kb="http://localhost:5601"
+    curl -sf "$kb/api/status" -o /dev/null 2>/dev/null || return 0
     local exists
-    exists=$(curl -s "http://localhost:5601/api/data_views" 2>/dev/null | \
-        python3 -c "import sys,json; dvs=json.load(sys.stdin); print('yes' if '$pattern' in [d.get('title','') for d in dvs.get('data_view',[])] else 'no')" 2>/dev/null)
-    [[ "$exists" == "yes" ]] && return
-    curl -s -o /dev/null -X POST "http://localhost:5601/api/data_views/data_view" \
+    exists=$(curl -s "$kb/api/data_views" 2>/dev/null | \
+        python3 -c "
+import sys, json
+try:
+    dvs = json.load(sys.stdin)
+    print('yes' if any(d.get('title') == sys.argv[1] for d in dvs.get('data_view', [])) else 'no')
+except Exception:
+    print('no')
+" "$pattern" 2>/dev/null || echo "no")
+    [[ "$exists" == "yes" ]] && return 0
+    local payload
+    payload=$(python3 -c "
+import json, sys
+print(json.dumps({'data_view':{'title':sys.argv[1],'timeFieldName':'@timestamp','name':sys.argv[2]}}))
+" "$pattern" "$name")
+    curl -s -o /dev/null \
+        -X POST "$kb/api/data_views/data_view" \
         -H 'kbn-xsrf: true' -H 'Content-Type: application/json' \
-        -d "{\"data_view\":{\"title\":\"$pattern\",\"timeFieldName\":\"@timestamp\",\"name\":\"$name\"}}"
+        -d "$payload"
 }
 
 report_ingest_quality() {
@@ -342,6 +356,18 @@ for n in out[:5]:
 PY
 }
 
+ask_yn() {
+    local prompt="$1"
+    if [ -t 0 ]; then
+        printf '%b[?]%b %s [y/N] ' "${YELLOW}" "${NC}" "$prompt" >&2
+        local ans
+        read -r ans
+        [[ "$ans" =~ ^[Yy]$ ]]
+    else
+        return 1
+    fi
+}
+
 require_ollama_ready() {
     local status
     status=$(curl -s -o /dev/null -w "%{http_code}" "$OLLAMA_URL/api/tags" || true)
@@ -435,9 +461,13 @@ load_pipeline() {
     local name="$1" file="$2"
     local status
     status=$(_yml_to_json "$file" | curl -s -o /dev/null -w "%{http_code}" -X PUT "$ES_URL/_ingest/pipeline/$name" -H 'Content-Type: application/json' --data-binary @-)
-    [[ "$status" == "200" ]] || die "Failed to load pipeline '$name' from $file (HTTP $status)"
+    if [[ "$status" != "200" ]]; then
+        echo "Failed to load pipeline '$name' from $file (HTTP $status)" >&2
+        return 1
+    fi
 }
 
+# Resolves --type to a pipeline name. Prints error to stderr and returns 1 on failure (does not exit).
 resolve_explicit_pipeline() {
     local t="$1"
     if pipeline_exists_in_es "$t"; then
@@ -456,14 +486,15 @@ resolve_explicit_pipeline() {
                     [[ -n "$h" ]] && echo "  - $h"
                 done <<< "$hints"
             } >&2
-            exit 1
+        else
+            echo "Pipeline '$t' not found in Elasticsearch or local folders ($PIPELINES_ES, $PIPELINES_CUSTOM, $PIPELINES_GEN)" >&2
         fi
-        die "Pipeline '$t' not found in Elasticsearch or local folders ($PIPELINES_ES, $PIPELINES_CUSTOM, $PIPELINES_GEN)"
+        return 1
     }
     local pname
     pname=$(basename "$p")
     pname="${pname%.*}"
-    load_pipeline "$pname" "$p"
+    load_pipeline "$pname" "$p" || return 1
     echo "$pname"
 }
 
@@ -556,6 +587,25 @@ wrap_now_pipeline() {
     echo "$now_name"
 }
 
+_ingest_direct() {
+    local format="$1" work_file="$2" index="$3"
+    local cef_json
+    case "$format" in
+        json)
+            info "Strategy: json direct ingest"
+            bulk_ingest_json "$work_file" "$index"
+            ;;
+        cef)
+            info "Strategy: cef convert + direct ingest"
+            cef_json=$(convert_cef "$work_file")
+            local n
+            n=$(bulk_ingest_json "$cef_json" "$index")
+            rm -f "$cef_json"
+            echo "$n"
+            ;;
+    esac
+}
+
 process_file() {
     local original="$1" fixed_pipeline="${2:-}"
     local tmp_files=()
@@ -584,42 +634,66 @@ process_file() {
         curl -s -X DELETE "$ES_URL/$index_pattern" >/dev/null 2>&1 || true
     fi
 
-    case "$format" in
-        json)
-            info "Strategy: json direct ingest"
-            count=$(bulk_ingest_json "$work_file" "$index")
-            ;;
-        cef)
-            info "Strategy: cef convert + direct ingest"
-            local cef_json
-            cef_json=$(convert_cef "$work_file")
-            tmp_files+=("$cef_json")
-            count=$(bulk_ingest_json "$cef_json" "$index")
-            ;;
-        other)
-            local pipeline="$fixed_pipeline"
-            if [[ -z "$pipeline" ]]; then
-                if [[ -n "$TYPE_OVERRIDE" ]]; then
-                    info "Strategy: explicit --type pipeline"
-                    pipeline=$(resolve_explicit_pipeline "$TYPE_OVERRIDE")
-                elif $USE_AI; then
-                    info "Strategy: --build-pipeline"
-                    local pname pfile
-                    pname="gen-${base}"
-                    pfile=$(generate_pipeline_ai "$work_file" "$pname")
-                    load_pipeline "$pname" "$pfile"
-                    pipeline="$pname"
-                else
-                    die "For text logs you must specify --type <pipeline> or --build-pipeline"
-                fi
-            fi
-            if $NOW; then
-                pipeline=$(wrap_now_pipeline "$pipeline")
-            fi
+    local pipeline=""
+
+    if [[ -n "$fixed_pipeline" ]]; then
+        # Batch mode: pipeline already resolved upstream
+        pipeline="$fixed_pipeline"
+        $NOW && pipeline=$(wrap_now_pipeline "$pipeline")
+        pipeline_used="$pipeline"
+        count=$(bulk_ingest_raw "$work_file" "$index" "$pipeline")
+
+    elif [[ -n "$TYPE_OVERRIDE" ]]; then
+        # --type always takes priority over detected format
+        info "Strategy: explicit --type pipeline"
+        if pipeline=$(resolve_explicit_pipeline "$TYPE_OVERRIDE"); then
+            $NOW && pipeline=$(wrap_now_pipeline "$pipeline")
             pipeline_used="$pipeline"
             count=$(bulk_ingest_raw "$work_file" "$index" "$pipeline")
-            ;;
-    esac
+        else
+            warn "Pipeline '$TYPE_OVERRIDE' could not be loaded."
+            case "$format" in
+                json|cef)
+                    if ask_yn "Log detected as $format — use direct $format ingest instead?"; then
+                        count=$(_ingest_direct "$format" "$work_file" "$index")
+                    else
+                        die "Aborted."
+                    fi
+                    ;;
+                *)
+                    die "Pipeline '$TYPE_OVERRIDE' failed and no automatic fallback for text logs. Try --build-pipeline."
+                    ;;
+            esac
+        fi
+
+    elif $USE_AI; then
+        case "$format" in
+            json|cef)
+                count=$(_ingest_direct "$format" "$work_file" "$index")
+                ;;
+            other)
+                info "Strategy: --build-pipeline"
+                local pname pfile
+                pname="gen-${base}"
+                pfile=$(generate_pipeline_ai "$work_file" "$pname")
+                load_pipeline "$pname" "$pfile" || die "Failed to load generated pipeline '$pname'"
+                pipeline="$pname"
+                $NOW && pipeline=$(wrap_now_pipeline "$pipeline")
+                pipeline_used="$pipeline"
+                count=$(bulk_ingest_raw "$work_file" "$index" "$pipeline")
+                ;;
+        esac
+
+    else
+        case "$format" in
+            json|cef)
+                count=$(_ingest_direct "$format" "$work_file" "$index")
+                ;;
+            other)
+                die "For text logs you must specify --type <pipeline> or --build-pipeline"
+                ;;
+        esac
+    fi
 
     ensure_data_view "$index_pattern" "$base"
     report_ingest_quality "$index" "$pipeline_used" "$KEEP"
@@ -639,7 +713,7 @@ if $BATCH; then
     KEEP=true
     info "Batch mode: forcing keep semantics across all files"
     if [[ -n "$TYPE_OVERRIDE" ]]; then
-        shared_pipeline=$(resolve_explicit_pipeline "$TYPE_OVERRIDE")
+        shared_pipeline=$(resolve_explicit_pipeline "$TYPE_OVERRIDE") || die "Batch aborted: pipeline '$TYPE_OVERRIDE' could not be loaded."
         info "Batch strategy: explicit pipeline '$shared_pipeline' for all files"
     elif $USE_AI; then
         require_ollama_ready
@@ -655,7 +729,7 @@ if $BATCH; then
         if [[ "$fmt" == "other" ]]; then
             batch_name="gen-batch-$(basename "$FOLDER" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9\n' '-')"
             batch_file=$(generate_pipeline_ai "$first" "$batch_name")
-            load_pipeline "$batch_name" "$batch_file"
+            load_pipeline "$batch_name" "$batch_file" || die "Failed to load generated pipeline '$batch_name'"
             shared_pipeline="$batch_name"
             info "Batch strategy: generated pipeline '$shared_pipeline' from first file, reusing for remaining files"
         else

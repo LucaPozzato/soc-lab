@@ -62,7 +62,7 @@ cmd_start() {
   ok "Docker runtime ready"
 
   section "Preparing Folders"
-  mkdir -p "$REPO_ROOT/docker-logs/suricata" "$REPO_ROOT/logs" "$REPO_ROOT/pcap" "$REPO_ROOT/rules/suricata" "$REPO_ROOT/rules/sigma"
+  mkdir -p "$REPO_ROOT/docker-logs/suricata" "$REPO_ROOT/docker-logs/rules" "$REPO_ROOT/logs" "$REPO_ROOT/pcap" "$REPO_ROOT/rules/suricata" "$REPO_ROOT/rules/sigma"
   ok "Runtime folders ready"
 
   section "Runtime Scripts"
@@ -106,6 +106,13 @@ cmd_start() {
     docker logs suricata --tail 20 2>/dev/null || true
     die "Suricata container is not running"
   fi
+  info "Refreshing ET community rules"
+  if docker exec suricata suricata-update --suricata-conf /etc/suricata/suricata.yaml --output /var/lib/suricata/rules --no-merge --no-test --no-reload >/dev/null 2>&1; then
+    docker exec suricata rm -f /var/lib/suricata/rules/dnp3-events.rules /var/lib/suricata/rules/modbus-events.rules >/dev/null 2>&1 || true
+    ok "ET community rules refreshed"
+  else
+    warn "ET rules refresh failed; continuing with existing rules"
+  fi
   for i in $(seq 1 60); do
     count=$(docker exec suricata sh -c 'ls /var/lib/suricata/rules/*.rules 2>/dev/null | wc -l' 2>/dev/null | tr -d ' ')
     if [[ "$count" -gt 0 ]]; then
@@ -132,26 +139,30 @@ cmd_start() {
   section "Aliases and Data Views"
   curl -s -X PUT "http://localhost:9200/_index_template/soc-lab-single-node" -H 'Content-Type: application/json' -d '{"index_patterns":["suricata-*","elastalert2_*","logs-*"],"priority":300,"template":{"settings":{"index.number_of_replicas":0}}}' >/dev/null 2>&1
   curl -s -X PUT "http://localhost:9200/_index_template/suricata-soc-alerts" -H 'Content-Type: application/json' -d '{"index_patterns":["suricata-*"],"template":{"aliases":{"soc-alerts":{"filter":{"bool":{"should":[{"term":{"event.dataset":"alert"}},{"term":{"event.dataset":"suricata.alert"}},{"term":{"tags":"alert"}}],"minimum_should_match":1}}}}}}}' >/dev/null 2>&1
-  curl -s -X POST "http://localhost:9200/_aliases" -H 'Content-Type: application/json' -d '{"actions":[{"remove":{"index":"suricata-*","alias":"soc-alerts"}},{"add":{"index":"suricata-*","alias":"soc-alerts","filter":{"bool":{"should":[{"term":{"event.dataset":"alert"}},{"term":{"event.dataset":"suricata.alert"}},{"term":{"tags":"alert"}}],"minimum_should_match":1}}}}]}' >/dev/null 2>&1 || true
+  curl -s -X POST "http://localhost:9200/_aliases" -H 'Content-Type: application/json' -d '{"actions":[{"remove":{"index":"suricata-*","alias":"soc-alerts","must_exist":false}},{"add":{"index":"suricata-*","alias":"soc-alerts","filter":{"bool":{"should":[{"term":{"event.dataset":"alert"}},{"term":{"event.dataset":"suricata.alert"}},{"term":{"tags":"alert"}}],"minimum_should_match":1}}}}]}' >/dev/null 2>&1 || true
   if curl -s "http://localhost:9200/_cat/indices/elastalert2_alerts?h=index" | grep -q '^elastalert2_alerts$'; then
     curl -s -X POST "http://localhost:9200/_aliases" -H 'Content-Type: application/json' -d '{"actions":[{"add":{"index":"elastalert2_alerts","alias":"soc-alerts"}}]}' >/dev/null 2>&1
   fi
 
   for i in $(seq 1 24); do
     if curl -s http://localhost:5601/api/status 2>/dev/null | grep -q '"level":"available"'; then
-      for dv in \
-        '{"title":"*","timeFieldName":"@timestamp","name":"All Logs"}' \
-        '{"title":"suricata-*","timeFieldName":"@timestamp","name":"Suricata"}' \
-        '{"title":"elastalert2_alerts","timeFieldName":"@timestamp","name":"ElastAlert2 Alerts"}' \
-        '{"title":"soc-alerts","timeFieldName":"@timestamp","name":"Alerts"}'; do
-        curl -s -o /dev/null -X POST "http://localhost:5601/api/data_views/data_view" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' -d "{\"data_view\":$dv}"
-      done
+      ensure_kibana_data_view "*"                  "@timestamp" "All Logs"
+      ensure_kibana_data_view "suricata-*"         "@timestamp" "Suricata"
+      ensure_kibana_data_view "elastalert2_alerts" "@timestamp" "ElastAlert2 Alerts"
+      ensure_kibana_data_view "soc-alerts"         "@timestamp" "Alerts"
       ok "Kibana data views ensured"
       break
     fi
     sleep 5
     [[ "$i" -eq 24 ]] && warn "Kibana not ready: data views not created"
   done
+
+  section "Rules Watcher"
+  if "$REPO_ROOT/scripts/commands/rules.sh" watch-start; then
+    ok "Rules watcher setup complete"
+  else
+    warn "Rules watcher setup failed"
+  fi
 
   banner "SOC Lab Ready"
   info "Kibana: http://localhost:5601"
@@ -161,6 +172,7 @@ cmd_start() {
 
 cmd_stop() {
   banner "SOC Lab Stack Stop"
+  "$REPO_ROOT/scripts/commands/rules.sh" watch-stop >/dev/null 2>&1 || true
   docker compose down
   ok "Stack stopped; volumes preserved"
 }
@@ -179,6 +191,7 @@ cmd_uninstall() {
   confirm "Proceed with uninstall?" || { info "Uninstall aborted"; exit 0; }
 
   section "Containers and Volumes"
+  "$REPO_ROOT/scripts/commands/rules.sh" watch-stop >/dev/null 2>&1 || true
   docker compose down -v || true
 
   section "Runtime Artifacts"

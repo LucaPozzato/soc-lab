@@ -9,4 +9,9 @@ if ! command -v go >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+  echo "[*] Running Bubble Tea TUI as $SUDO_USER (root not required)"
+  exec sudo -u "$SUDO_USER" -E go -C "$REPO_ROOT/tui" run ./cmd/soclabtui
+fi
+
 exec go -C "$REPO_ROOT/tui" run ./cmd/soclabtui

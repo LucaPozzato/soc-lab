@@ -25,20 +25,19 @@ usage() {
   printf "  %-10s %-40s\n" "-----" "--------"
   printf "  %-10s %-40s\n" "stack" "install | start | stop | reset | uninstall | status"
   printf "  %-10s %-40s\n" "capture" "replay | live | upload"
-  printf "  %-10s %-40s\n" "rules" "reload"
-  printf "  %-10s %-40s\n" "so" "sync | pipelines | templates"
+  printf "  %-10s %-40s\n" "rules" "compile"
   printf "  %-10s %-40s\n" "health" "check"
-  printf "  %-10s %-40s\n" "tui" "interactive command shell"
-  printf "  %-10s %-40s\n" "tui-bt" "Bubble Tea TUI preview"
+  printf "  %-10s %-40s\n" "tui" "Bubble Tea TUI"
+  printf "  %-10s %-40s\n" "tui-shell" "Legacy interactive command shell"
   printf "\n"
   printf "  %-10s %s\n" "Examples" ""
   printf "    soc-lab stack install\n"
+  printf "    soc-lab install\n"
   printf "    soc-lab stack start\n"
   printf "    soc-lab capture replay pcap/<capture-file>.pcap --now\n"
   printf "    soc-lab capture live en0 10\n"
   printf "    soc-lab capture upload logs/<log-file> --type <pipeline>\n"
-  printf "    soc-lab rules reload\n"
-  printf "    soc-lab so sync\n"
+  printf "    soc-lab rules compile\n"
   printf "    soc-lab health check\n"
   printf "\n"
   printf "  %-10s %s\n" "Note" "Run without arguments to open interactive TUI"
@@ -52,6 +51,9 @@ group="${1:-}"
 cmd="${2:-}"
 
 case "$group" in
+  install)
+    run_command "$ROOT_DIR/scripts/commands/stack.sh" install
+    ;;
   stack)
     shift
     run_command "$ROOT_DIR/scripts/commands/stack.sh" "$@"
@@ -74,17 +76,17 @@ case "$group" in
     ;;
   tui)
     shift
-    run_command "$ROOT_DIR/scripts/commands/tui.sh" "$@"
-    ;;
-  tui-bt)
-    shift
     run_command "$ROOT_DIR/scripts/commands/tui-bubbletea.sh" "$@"
+    ;;
+  tui-shell)
+    shift
+    run_command "$ROOT_DIR/scripts/commands/tui.sh" "$@"
     ;;
   -h|--help|help)
     usage
     ;;
   "")
-    run_command "$ROOT_DIR/scripts/commands/tui.sh"
+    run_command "$ROOT_DIR/scripts/commands/tui-bubbletea.sh"
     ;;
   *)
     err "Unknown group: $group"

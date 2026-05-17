@@ -56,13 +56,18 @@ info "PCAP: $PCAP_NAME"
 
 if [[ "$KEEP" == "false" ]]; then
   section "Resetting Replay State"
+  info "Deleting suricata indices"
   curl -s "http://localhost:9200/_cat/indices/suricata-*?h=index" | xargs -I{} curl -s -X DELETE "http://localhost:9200/{}" >/dev/null || true
+  info "Clearing ElastAlert2 alert indices"
   dq='{"query":{"match_all":{}}}'
   for idx in elastalert2_alerts elastalert2_alerts_status elastalert2_alerts_silence; do
     curl -s -X POST "http://localhost:9200/${idx}/_delete_by_query" -H 'Content-Type: application/json' -d "$dq" >/dev/null 2>&1 || true
   done
+  info "Stopping ElastAlert2"
   docker stop elastalert2 >/dev/null || true
+  info "Clearing Suricata logs"
   docker exec suricata sh -c ': > /var/log/suricata/eve.json; : > /var/log/suricata/suricata.log'
+  ok "State reset complete"
 else
   section "Keep Mode"
   info "Preserving existing indexed data and existing alerts"

@@ -24,8 +24,7 @@ print_help() {
   printf "  %-18s %-24s %s\n" "capture" "capture replay <pcap>" "Replay a PCAP through Suricata"
   printf "  %-18s %-24s %s\n" "capture" "capture live [iface] [sec]" "Continuous capture + replay"
   printf "  %-18s %-24s %s\n" "capture" "capture upload ..." "Upload non-Suricata logs"
-  printf "  %-18s %-24s %s\n" "rules" "rules reload" "Refresh Suricata rules"
-  printf "  %-18s %-24s %s\n" "so" "so sync" "Load SO templates + pipelines"
+  printf "  %-18s %-24s %s\n" "rules" "rules compile" "Compile-check Suricata and Sigma rules"
   printf "  %-18s %-24s %s\n" "health" "health check" "Stack health summary"
 
   section "Examples"
