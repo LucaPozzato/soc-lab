@@ -18,7 +18,19 @@ err()   { printf "  ${RED}✗${NC} %s\n" "$*" >&2; }
 step()  { printf "\n${BOLD}%s${NC}\n" "$*"; }
 die()   { err "$*"; exit 1; }
 
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  owner="${SUDO_USER:-$USER}"
+  die "Do not run start.sh with sudo. Fix root-owned state with: sudo chown -R \"$owner:$owner\" runtime .soc-lab data/pcap .venv"
+fi
+
+ensure_writable_dir() {
+  local d="$1"
+  mkdir -p "$d"
+  [[ -w "$d" ]] || die "Directory is not writable: $d. Fix ownership with: sudo chown -R \"$USER:$USER\" \"$d\""
+}
+
 mkdir -p "$STATE_DIR"
+export PYTHONDONTWRITEBYTECODE=1
 
 # ── sanity checks ─────────────────────────────────────────────────────────────
 
@@ -28,6 +40,14 @@ command -v docker >/dev/null 2>&1 || die "docker not found — install Docker fi
 docker info >/dev/null 2>&1      || die "Docker daemon not running — start Docker first"
 command -v python3 >/dev/null 2>&1 || die "python3 not found"
 info "Docker is running"
+
+step "Preparing writable runtime directories"
+ensure_writable_dir "$STATE_DIR"
+ensure_writable_dir "$ROOT_DIR/runtime/logs/suricata"
+ensure_writable_dir "$ROOT_DIR/runtime/logs/rules"
+ensure_writable_dir "$ROOT_DIR/data/pcap"
+ensure_writable_dir "$ROOT_DIR/data/pcap/live"
+info "Runtime directories are writable"
 
 # ── python venv ───────────────────────────────────────────────────────────────
 

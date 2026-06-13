@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -158,7 +159,10 @@ def _run_replay_job(target_pcap: str, keep: bool, now: bool, pcap_name: str) -> 
         log(f"[INFO] keep={keep}  now={now}  pcap={pcap_name}")
         from core.capture.replay import (
             _resolve_pcap, _delete_suricata_indices, _clear_elastalert_indices,
-            ensure_soc_alerts_alias, _shift_timestamps, _wait_for_docs,
+            ensure_soc_alerts_alias, _wait_for_docs,
+            _eve_event_count, _suricata_doc_count, _fix_suricata_log_ownership,
+            _as_added_counts, _soc_alert_doc_count,
+            _parse_eve_lines, _shift_events_to_now, _append_eve_events, _valid_eve_event_count,
         )
         from core.elastic.aliases import ensure_suricata_alias
         import subprocess as sp
@@ -166,14 +170,6 @@ def _run_replay_job(target_pcap: str, keep: bool, now: bool, pcap_name: str) -> 
         abs_path = _resolve_pcap(target_pcap)
         pcap_dir_real = (repo_root() / "data" / "pcap").resolve()
         pcap_rel = str(abs_path.relative_to(pcap_dir_real))
-
-        # Always pause Filebeat when clearing (keep=False) so it can't recreate
-        # suricata-* from old eve.json data between the index delete and the clear.
-        # Also pause when shifting timestamps (now=True) so it reads shifted events.
-        pause_filebeat = not keep or now
-        if pause_filebeat:
-            sp.run(["docker", "stop", "filebeat"], capture_output=True)
-            log("[INFO] Filebeat paused")
 
         if not keep:
             log("[INFO] Clearing previous Suricata indices…")
@@ -183,43 +179,76 @@ def _run_replay_job(target_pcap: str, keep: bool, now: bool, pcap_name: str) -> 
             sp.run(["docker", "exec", "suricata", "sh", "-c",
                     ": > /var/log/suricata/eve.json; : > /var/log/suricata/suricata.log"],
                    capture_output=True)
+            _fix_suricata_log_ownership()
 
         log("[INFO] Ensuring soc-alerts alias…")
         ensure_soc_alerts_alias()
+        baseline_docs = _suricata_doc_count()
+        baseline_soc_docs = _soc_alert_doc_count()
+        baseline_events = _eve_event_count()
 
         log(f"[INFO] Starting Suricata replay: {pcap_rel}")
-        proc = sp.Popen(
-            ["docker", "exec", "suricata", "suricata",
-             "-c", "/etc/suricata/suricata.yaml",
-             "-r", f"/pcap/{pcap_rel}",
-             "--pidfile", "/var/run/suricata-replay.pid",
-             "-l", "/var/log/suricata",
-             "-k", "none"],
-            stdout=sp.PIPE, stderr=sp.STDOUT, text=True,
-        )
-        assert proc.stdout
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line:
-                log(line)
-        proc.wait()
+        if now:
+            tmp_log_dir = f"/tmp/soc-lab-replay-api-{os.getpid()}-{int(time.time())}"
+            sp.run(["docker", "exec", "suricata", "sh", "-c", f"rm -rf {tmp_log_dir} && mkdir -p {tmp_log_dir}"], capture_output=True)
+            try:
+                proc = sp.Popen(
+                    ["docker", "exec", "suricata", "suricata",
+                     "-c", "/etc/suricata/suricata.yaml",
+                     "-r", f"/pcap/{pcap_rel}",
+                     "--pidfile", "/var/run/suricata-replay.pid",
+                     "-l", tmp_log_dir,
+                     "-k", "none"],
+                    stdout=sp.PIPE, stderr=sp.STDOUT, text=True,
+                )
+                assert proc.stdout
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        log(line)
+                proc.wait()
+                if proc.returncode == 0:
+                    raw_eve = sp.run(
+                        ["docker", "exec", "suricata", "sh", "-c", f"cat {tmp_log_dir}/eve.json 2>/dev/null || true"],
+                        capture_output=True, text=True,
+                    ).stdout
+                    events = _parse_eve_lines(raw_eve)
+                    _shift_events_to_now(events)
+                    eve = repo_root() / "runtime" / "logs" / "suricata" / "eve.json"
+                    eve.parent.mkdir(parents=True, exist_ok=True)
+                    _fix_suricata_log_ownership()
+                    _append_eve_events(eve, events)
+                    replay_new_events = _valid_eve_event_count(events)
+                else:
+                    replay_new_events = 0
+            finally:
+                sp.run(["docker", "exec", "suricata", "sh", "-c", f"rm -rf {tmp_log_dir}"], capture_output=True)
+        else:
+            proc = sp.Popen(
+                ["docker", "exec", "suricata", "suricata",
+                 "-c", "/etc/suricata/suricata.yaml",
+                 "-r", f"/pcap/{pcap_rel}",
+                 "--pidfile", "/var/run/suricata-replay.pid",
+                 "-l", "/var/log/suricata",
+                 "-k", "none"],
+                stdout=sp.PIPE, stderr=sp.STDOUT, text=True,
+            )
+            assert proc.stdout
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    log(line)
+            proc.wait()
+            _fix_suricata_log_ownership()
+            replay_new_events = max(_eve_event_count() - baseline_events, 0)
 
         if proc.returncode != 0:
-            if pause_filebeat:
-                sp.run(["docker", "start", "filebeat"], capture_output=True)
             log(f"[ERROR] Suricata exited with code {proc.returncode}")
             job["error"] = "Suricata replay failed"
             return
 
         if now:
-            eve = repo_root() / "runtime" / "logs" / "suricata" / "eve.json"
-            if eve.exists():
-                log("[INFO] Shifting event timestamps to now…")
-                _shift_timestamps(eve)
-
-        if pause_filebeat:
-            sp.run(["docker", "start", "filebeat"], capture_output=True)
-            log("[INFO] Filebeat resumed")
+            log("[INFO] Shifted replay timestamps to now before Filebeat ingestion")
 
         ensure_soc_alerts_alias()
         ensure_suricata_alias()
@@ -229,9 +258,21 @@ def _run_replay_job(target_pcap: str, keep: bool, now: bool, pcap_name: str) -> 
             log("[INFO] ElastAlert2 restarted")
 
         log("[INFO] Waiting for docs to appear in Elasticsearch…")
-        docs = _wait_for_docs()
+        new_events = replay_new_events
+        expected_docs = baseline_docs + new_events
+        if new_events:
+            log(f"[INFO] Suricata eve.json new events: {new_events:,}")
+        docs = _as_added_counts(
+            _wait_for_docs(expected_suricata_docs=expected_docs),
+            baseline_docs,
+            baseline_soc_docs,
+        )
         log(f"[INFO] Suricata docs: +{docs.get('suricata_docs', 0):,}")
+        if "suricata_docs_total" in docs:
+            log(f"[INFO] Suricata docs total: {docs.get('suricata_docs_total', 0):,}")
         log(f"[INFO] soc-alerts docs: +{docs.get('soc_alerts_docs', 0)}")
+        if "soc_alerts_docs_total" in docs:
+            log(f"[INFO] soc-alerts docs total: {docs.get('soc_alerts_docs_total', 0):,}")
         if docs.get("warning"):
             log(f"[WARN] {docs['warning']}")
 

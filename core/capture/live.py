@@ -13,6 +13,14 @@ from typing import Any
 from core.settings import repo_root
 
 
+def _fix_suricata_log_ownership() -> None:
+    subprocess.run(
+        ["docker", "exec", "suricata", "sh", "-c",
+         f"chown {os.getuid()}:{os.getgid()} /var/log/suricata/eve.json /var/log/suricata/suricata.log 2>/dev/null || true"],
+        capture_output=True,
+    )
+
+
 def _check_prereqs(interface: str) -> None:
     if not shutil.which("dumpcap"):
         raise RuntimeError("dumpcap not found. Install Wireshark/tshark.")
@@ -34,8 +42,6 @@ def _check_prereqs(interface: str) -> None:
 
 def _reset_session() -> None:
     from core.elastic.client import client as es_client
-    # Pause Filebeat before truncating eve.json so its cursor resets cleanly
-    subprocess.run(["docker", "stop", "filebeat"], capture_output=True)
     es = es_client()
     rows = es.options(ignore_status=[404]).cat.indices(index="suricata-*", format="json", h="index")
     for row in rows or []:
@@ -50,7 +56,7 @@ def _reset_session() -> None:
          ": > /var/log/suricata/eve.json; : > /var/log/suricata/suricata.log"],
         capture_output=True,
     )
-    subprocess.run(["docker", "start", "filebeat"], capture_output=True)
+    _fix_suricata_log_ownership()
 
 
 def _ensure_alert_aliases() -> None:
@@ -69,6 +75,7 @@ def _replay_chunk(name: str, pcap_dir: Path) -> bool:
          "-k", "none"],
         capture_output=True, text=True,
     )
+    _fix_suricata_log_ownership()
     return result.returncode == 0
 
 
@@ -106,7 +113,11 @@ def live(interface: str = "en0", rotation_secs: int = 10, *, keep: bool = False)
 
     pcap_dir.mkdir(parents=True, exist_ok=True)
     if not os.access(pcap_dir, os.W_OK):
-        raise PermissionError(f"Capture directory is not writable: {pcap_dir}")
+        raise PermissionError(
+            f"Capture directory is not writable: {pcap_dir}. "
+            "If it was created by sudo/root, fix it with: "
+            f"sudo chown -R {os.getuid()}:{os.getgid()} {pcap_dir}"
+        )
 
     # Clean up previous session files
     for f in pcap_dir.glob("capture_*.pcap"):

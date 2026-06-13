@@ -192,13 +192,13 @@ If FastAPI is the public backend boundary, `core/` is the actual engine room.
         +-------------------+----------------------+--------------------+
                             |                      |
                             |                      |
-              +-------------+----+      +---------+------------------+
+              +-------------+----+      +----------+-----------------+
               |                  |      |                            |
               v                  v      v                            v
-      +---------------+   +-------------+----------------+   +---------------+
-      | Docker Compose |   | Elasticsearch and Kibana    |   | local files   |
-      | service ctrl   |   | search, ingest, aliases     |   | config/data   |
-      +---------------+   +------------------------------+   +---------------+
+      +----------------+   +----------------------------+   +---------------+
+      | Docker Compose |   | Elasticsearch and Kibana   |   | local files   |
+      | service ctrl   |   | search, ingest, aliases    |   | config/data   |
+      +----------------+   +----------------------------+   +---------------+
 ```
 
 ## Data-Centric View
